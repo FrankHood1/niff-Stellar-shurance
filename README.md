@@ -63,5 +63,9 @@ Copy `frontend/.env.example` → `frontend/.env.local`.
 - #1524: Frontend — Claim discussion thread
 <!-- handsoff-issue-1528 -->
 - #1528: Frontend — Vote delegation UI
+<!-- handsoff-issue-1537 -->
+- #1537: Frontend — Admin configuration: assets, feature flags and pause controls
+<!-- handsoff-issue-1538 -->
+- #1538: Frontend — Admin governance: voters, delegations and audit log
 <!-- handsoff-issue-1539 -->
 - #1539: Frontend — Admin content: FAQ and announcements
