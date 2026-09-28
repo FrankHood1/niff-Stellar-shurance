@@ -112,7 +112,7 @@ pub fn initiate_policy(
 
     storage::set_policy(env, &holder, policy_id, &policy);
     storage::increment_holder_active_policies(env, &holder);
-    storage::voters_ensure_holder(env, &holder);
+    let _ = storage::voters_ensure_holder(env, &holder);
     // Issue #812: index the new policy for status-based queries.
     storage::index_new_policy(env, &holder, policy_id, &policy);
 

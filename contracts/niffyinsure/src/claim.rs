@@ -354,6 +354,16 @@ pub fn file_claim(
         return Err(Error::DuplicateOpenClaim);
     }
 
+    // Per-policy cooldown after the last resolved claim (if configured).
+    let cooldown = storage::get_cooldown_ledgers(env);
+    if cooldown > 0 {
+        if let Some(last) = storage::get_last_claim_resolved_ledger(env, holder, policy_id) {
+            if now.saturating_sub(last) < cooldown {
+                return Err(Error::CooldownActive);
+            }
+        }
+    }
+
     // Anchor for restoring per-holder rate limit if claimant later withdraws (see `withdraw_claim`).
     let rate_limit_anchor_before_filing = storage::get_last_claim_ledger(env, holder);
 
@@ -413,7 +423,7 @@ pub fn file_claim(
 
     let mut status_history: Vec<ClaimStatusHistoryEntry> = Vec::new(env);
     push_status_transition(&mut status_history, ClaimStatus::Processing, now);
-    storage::snapshot_claim_voters(env, claim_id);
+    storage::snapshot_claim_voters(env, claim_id, holder);
     let eligible_voter_count = storage::get_claim_voters(env, claim_id).len();
 
     let claim = Claim {

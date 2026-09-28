@@ -77,6 +77,8 @@ pub enum PolicyError {
     /// The global voter registry has reached its configured maximum.
     /// No additional voters can be registered until some are removed.
     VoterRegistryFull = 128,
+    /// Holder token allowance is insufficient to cover the premium transfer.
+    InsufficientAllowance = 129,
 }
 
 #[contracttype]
@@ -373,6 +375,12 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::VoterRegistryCapExceeded => {
             "batch would push the global voter registry past its configured maximum"
         }
+        Error::VoterRegistryFull => {
+            "voter registry is full; remove voters before registering more"
+        }
+        Error::CorruptSnapshotEntry => {
+            "claim voter snapshot entry has non-positive voting power"
+        }
     };
 
     QuoteFailure {
@@ -565,17 +573,9 @@ pub fn initiate_policy(
 
     let fee_bps = storage::get_protocol_fee_bps(env);
     let fee_recipient = storage::get_fee_recipient(env);
-    let fee_amount = if fee_bps == 0 {
-        0
-    } else {
-        premium_amount
-            .checked_mul(fee_bps as i128)
-            .ok_or(PolicyError::PremiumOverflow)?
-            / 10_000
-    };
-    let treasury_amount = premium_amount
-        .checked_sub(fee_amount)
-        .ok_or(PolicyError::PremiumOverflow)?;
+    let (treasury_amount, fee_amount) =
+        crate::premium_pure::split_premium(premium_amount, fee_bps)
+            .map_err(|_| PolicyError::PremiumOverflow)?;
 
     // Pre-flight allowance check (before any state changes): surface a
     // friendly `InsufficientAllowance` error instead of letting the

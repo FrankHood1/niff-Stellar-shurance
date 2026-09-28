@@ -195,6 +195,22 @@ pub fn checked_mul_ratio(
     }
 }
 
+/// Split a premium into treasury credit and protocol fee.
+///
+/// `fee = floor(amount * fee_bps / 10_000)`, `to_treasury = amount - fee`.
+/// Stroops are conserved: `to_treasury + fee == amount` for every valid input.
+pub fn split_premium(amount: i128, fee_bps: u32) -> Result<(i128, i128), Error> {
+    if amount < 0 {
+        return Err(Error::NegativePremiumNotSupported);
+    }
+    if fee_bps == 0 {
+        return Ok((amount, 0));
+    }
+    let fee = checked_mul_ratio(amount, fee_bps as i128, 10_000, Rounding::Floor)?;
+    let to_treasury = checked_sub(amount, fee)?;
+    Ok((to_treasury, fee))
+}
+
 // ── Unit tests (no Soroban Env required) ─────────────────────────────────────
 
 #[cfg(test)]
@@ -385,6 +401,38 @@ mod tests {
         assert_eq!(result.steps[2].component, "coverage");
         assert_eq!(result.steps[3].component, "safety_multiplier");
         assert_eq!(result.steps[4].component, "final_rounding");
+    }
+
+    #[test]
+    fn split_premium_conserves_stroops_for_many_inputs() {
+        let amounts = [
+            0i128, 1, 2, 3, 7, 9, 10, 99, 100, 101, 999, 1_000, 10_000, 1_000_000,
+            9_999_999_999,
+        ];
+        let bps_values = [0u32, 1, 2, 7, 250, 333, 500, 999, 1_000, 1_337, 2_000, 5_000, 10_000];
+        for &amount in &amounts {
+            for &bps in &bps_values {
+                let (to_treasury, fee) = split_premium(amount, bps).unwrap();
+                assert_eq!(
+                    to_treasury + fee,
+                    amount,
+                    "amount={amount} bps={bps}: treasury={to_treasury} fee={fee}"
+                );
+                assert!(fee >= 0 && to_treasury >= 0);
+                if bps == 0 {
+                    assert_eq!(fee, 0);
+                    assert_eq!(to_treasury, amount);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_premium_floor_example() {
+        // 1000 * 250 / 10_000 = 25 exactly
+        assert_eq!(split_premium(1_000, 250).unwrap(), (975, 25));
+        // 999 * 250 / 10_000 = 24.975 → floor 24
+        assert_eq!(split_premium(999, 250).unwrap(), (975, 24));
     }
 
     #[test]
