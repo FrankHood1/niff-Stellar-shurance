@@ -12,15 +12,6 @@ pub const IMAGE_URL_MAX_LEN: u32 = 128;
 pub const MAX_EVIDENCE_URL_BYTES: u32 = 2048;
 /// Default evidence attachment limit when admin config is unset.
 pub const IMAGE_URLS_MAX: u32 = 5;
-/// Maximum byte length of a single evidence URL accepted by `file_claim`.
-///
-/// Rationale: Soroban host functions cap total invocation argument size, and
-/// `Vec<ClaimEvidenceEntry>` is passed inline in every `file_claim` call. An
-/// unbounded (or very long) URL string multiplies storage cost per claim and
-/// pushes a batch of evidence entries toward the Soroban argument size limit.
-/// 128 bytes comfortably fits IPFS CIDs and allowlisted gateway URLs while
-/// keeping per-claim storage cost predictable.
-pub const MAX_EVIDENCE_URL_BYTES: u32 = 128;
 pub const REASON_MAX_LEN: u32 = 128;
 pub const SAFETY_SCORE_MAX: u32 = 100;
 
@@ -611,10 +602,34 @@ pub enum MultiplierKey {
     SafetyDiscount,
 }
 
-#[contractevent(topics = ["niffyinsure", "premium_table_updated"])]
+/// Emitted when the global multiplier table is replaced (`update_multiplier_table`).
+/// Carries the new table version counter so indexers can track pricing config.
+#[contractevent(topics = ["niffyinsure", "multiplier_table_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PremiumTableUpdated {
+pub struct MultiplierTableUpdated {
     pub version: u32,
+}
+
+/// Backward-compatible alias for [`MultiplierTableUpdated`].
+pub type PremiumTableUpdated = MultiplierTableUpdated;
+
+/// Which engine produced a quote.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CalcSource {
+    Local,
+    External,
+}
+
+/// Read-only quote result returned by `generate_premium` / `generate_premium_for_asset`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteResult {
+    pub premium: i128,
+    pub coverage: i128,
+    pub asset: Option<Address>,
+    pub table_version: u32,
+    pub calc_source: CalcSource,
 }
 
 /// Emitted by `admin_set_premium_multiplier` for each granular update.
