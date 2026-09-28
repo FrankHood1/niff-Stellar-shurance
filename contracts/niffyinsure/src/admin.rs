@@ -674,13 +674,23 @@ fn sweep_token_inner(
     }
 
     // Protected balance check: ensure sweep won't violate user entitlements
+    // (approved-but-unpaid claims) OR internal reserved coverage (issue #1427).
     let protected_balance = calculate_protected_balance(env, &asset);
+    let reserved = crate::ledger::get_reserved_coverage(env, &asset);
+    let floor = if reserved > protected_balance {
+        reserved
+    } else {
+        protected_balance
+    };
     let current_balance = crate::token::get_balance(env, &asset);
     let remaining_balance = current_balance.saturating_sub(amount);
 
-    if remaining_balance < protected_balance {
+    if remaining_balance < floor {
         panic_with_error!(env, AdminError::ProtectedBalanceViolation);
     }
+
+    // Effects: debit internal treasury when the book has a balance.
+    let _ = crate::ledger::record_sweep(env, &asset, amount);
 
     // Execute sweep using SEP-41 transfer
     crate::token::sweep_asset(env, &asset, &recipient, amount);

@@ -140,6 +140,7 @@ fn all_parameterised_variants(env: &Env) -> Vec<DataKey> {
         DataKey::Subscription(0),
         DataKey::OwnerSubscriptionIds(za.clone()),
         DataKey::AssetDecimals(za.clone()),
+        DataKey::AssetLedger(za.clone()),
     ]
 }
 

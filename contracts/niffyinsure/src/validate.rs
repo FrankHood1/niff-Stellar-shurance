@@ -160,6 +160,8 @@ pub enum Error {
     VoterRegistryCapExceeded = 89,
     /// Individual voter registration would exceed [`storage::MAX_ELIGIBLE_VOTERS`].
     VoterRegistryFull = 90,
+    /// Claim voter snapshot contains a zero/negative power override (corruption).
+    CorruptSnapshotEntry = 91,
 }
 
 pub fn check_claim_evidence_update(

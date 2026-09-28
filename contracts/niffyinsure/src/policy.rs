@@ -77,6 +77,8 @@ pub enum PolicyError {
     /// The global voter registry has reached its configured maximum.
     /// No additional voters can be registered until some are removed.
     VoterRegistryFull = 128,
+    /// Holder has not approved this contract to spend enough of the premium asset.
+    InsufficientAllowance = 129,
 }
 
 #[contracttype]
@@ -373,6 +375,8 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::VoterRegistryCapExceeded => {
             "batch would push the global voter registry past its configured maximum"
         }
+        Error::VoterRegistryFull => "global voter registry is full",
+        Error::CorruptSnapshotEntry => "voter snapshot contains a corrupt (zero/negative) power entry",
     };
 
     QuoteFailure {
@@ -645,7 +649,8 @@ pub fn initiate_policy(
     }
 
     // Premium transfer: holder -> treasury and fee recipient using the policy's bound asset.
-    // Done BEFORE any durable writes so failure leaves no partial state.
+    // CEI: collect_premium_with_fee updates internal ledger counters before SEP-41 calls.
+    // Soroban aborts the whole frame on transfer failure, so no partial policy state persists.
     token::collect_premium_with_fee(
         env,
         &holder,
@@ -654,6 +659,11 @@ pub fn initiate_policy(
         &fee_recipient,
         fee_amount,
     );
+    // Reserve coverage against the asset ledger so sweeps cannot undercut liabilities.
+    ledger::reserve_coverage(env, &asset, base_amount).map_err(|e| match e {
+        validate::Error::Overflow => PolicyError::PremiumOverflow,
+        _ => PolicyError::InsufficientSolvency,
+    })?;
 
     let current_ledger = env.ledger().sequence();
     let end_ledger = current_ledger

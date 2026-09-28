@@ -9,7 +9,7 @@ pub mod delegation;
 pub mod events;
 pub mod governance;
 mod governance_token;
-mod ledger;
+pub mod ledger;
 pub mod policy;
 pub mod policy_lifecycle;
 pub mod premium;
@@ -69,12 +69,34 @@ struct VoterRemovedEvent {
     pub voter: Address,
 }
 
+/// Emitted on every `set_allowed_asset` call (issue #1425).
+#[contractevent(topics = ["niffyinsure", "asset_allowlist_updated"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssetAllowlistUpdated {
+    #[topic]
+    pub asset: Address,
+    pub allowed: bool,
+}
+
+/// Alias retained for older integrators that keyed on the previous topic name.
 #[contractevent(topics = ["niffyinsure", "allowed_asset_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AllowedAssetUpdated {
     #[topic]
     pub asset: Address,
     pub allowed: bool,
+}
+
+/// Emitted by `admin_sweep` / treasury capital movements (issue #1427).
+#[contractevent(topics = ["niffyinsure", "treasury_swept"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreasurySwept {
+    #[topic]
+    pub asset: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+    pub at_ledger: u32,
 }
 
 #[contractevent(topics = ["niffyinsure", "voting_duration_updated"])]
@@ -422,7 +444,15 @@ impl NiffyInsure {
     }
 
     /// Admin-only: add or remove an asset from the allowlist.
-    /// Always emits `asset_set` (idempotent — even if the state is unchanged).
+    ///
+    /// Always emits `AssetAllowlistUpdated` (idempotent — even if unchanged).
+    ///
+    /// # Delisting behaviour (issue #1425)
+    ///
+    /// Setting `allowed = false` blocks **new** binds and renewals for `asset`.
+    /// Existing policies denominated in that asset remain valid: claims may still
+    /// be filed and paid against the bound asset (grandfathering). Admin payout
+    /// asset overrides must still be allowlisted at payout time.
     pub fn set_allowed_asset(
         env: Env,
         asset: Address,
@@ -434,6 +464,14 @@ impl NiffyInsure {
         admin::check_and_update_gov_cooldown(&env);
         storage::bump_instance(&env);
         claim::set_allowed_asset(&env, &asset, allowed);
+        if allowed {
+            storage::set_asset_decimals(&env, &asset, decimals);
+        }
+        AssetAllowlistUpdated {
+            asset: asset.clone(),
+            allowed,
+        }
+        .publish(&env);
         AllowedAssetUpdated {
             asset: asset.clone(),
             allowed,
@@ -2161,6 +2199,7 @@ impl NiffyInsure {
     }
 
     /// Dust claims below min and over-coverage claims above max will revert.
+    /// Bounds must be strictly positive and satisfy `min_claim_amount <= max_claim_amount`.
     pub fn admin_set_asset_claim_bounds(
         env: Env,
         asset: Address,
@@ -2169,7 +2208,7 @@ impl NiffyInsure {
     ) -> Result<(), validate::Error> {
         let _admin = admin::require_admin(&env);
         admin::check_and_update_gov_cooldown(&env);
-        if min_claim_amount < 0 || max_claim_amount < min_claim_amount {
+        if min_claim_amount <= 0 || max_claim_amount <= 0 || min_claim_amount > max_claim_amount {
             return Err(validate::Error::ClaimAmountZero);
         }
         storage::set_allowed_asset_config(
@@ -2325,6 +2364,8 @@ impl NiffyInsure {
     }
 
     /// Authorized depositor-only: transfer capital into the treasury and emit an event.
+    ///
+    /// Asset must be allowlisted. Uses CEI via [`token::transfer_in`].
     pub fn deposit_treasury(
         env: Env,
         depositor: Address,
@@ -2338,11 +2379,14 @@ impl NiffyInsure {
         if !storage::is_authorized_depositor(&env, &depositor) {
             return Err(validate::Error::UnauthorizedTreasuryDepositor);
         }
+        if !storage::is_allowed_asset(&env, &asset) {
+            return Err(validate::Error::InvalidAsset);
+        }
 
         depositor.require_auth();
 
-        let client = soroban_sdk::token::TokenClient::new(&env, &asset);
-        client.transfer(&depositor, env.current_contract_address(), &amount);
+        // CEI: ledger credit then SEP-41 transfer into the contract.
+        crate::token::transfer_in(&env, &depositor, &asset, amount)?;
 
         TreasuryDeposited {
             depositor,
@@ -2352,6 +2396,91 @@ impl NiffyInsure {
         }
         .publish(&env);
 
+        Ok(())
+    }
+
+    /// Read-only: internal ledger treasury balance for `asset` (issue #1426).
+    ///
+    /// This is the bookkeeping counter, not the raw SEP-41 balance. Use
+    /// [`Self::get_treasury_balance`] for the configured treasury's token balance
+    /// of the default protocol token.
+    pub fn get_ledger_treasury_balance(env: Env, asset: Address) -> i128 {
+        ledger::get_treasury_balance(&env, &asset)
+    }
+
+    /// Read-only: reserved coverage for `asset`.
+    pub fn get_reserved_coverage(env: Env, asset: Address) -> i128 {
+        ledger::get_reserved_coverage(&env, &asset)
+    }
+
+    /// Read-only: lifetime premiums collected for `asset`.
+    pub fn get_total_premiums(env: Env, asset: Address) -> i128 {
+        ledger::get_total_premiums(&env, &asset)
+    }
+
+    /// Read-only: lifetime paid claims for `asset`.
+    pub fn get_total_paid(env: Env, asset: Address) -> i128 {
+        ledger::get_total_paid(&env, &asset)
+    }
+
+    /// Admin treasury sweep with per-ledger cap and under-reserve protection (issue #1427).
+    ///
+    /// - `to` must be an allowlisted payout recipient when it is a contract.
+    /// - Amount must not exceed `max_sweep_per_ledger` cumulative for this ledger.
+    /// - Remaining internal treasury must stay `>= reserved_coverage`.
+    pub fn admin_sweep(
+        env: Env,
+        asset: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), AdminError> {
+        storage::bump_instance(&env);
+        let admin = admin::require_treasury_admin(&env);
+        if amount <= 0 {
+            return Err(AdminError::InvalidSweepAmount);
+        }
+        if !storage::is_allowed_asset(&env, &asset) {
+            return Err(AdminError::AssetNotAllowlisted);
+        }
+        if to.executable().is_some() && !storage::is_allowed_payout_recipient(&env, &to) {
+            return Err(AdminError::InvalidAddress);
+        }
+
+        // Under-reserve check against internal ledger (regardless of cap).
+        if amount > ledger::available_to_sweep(&env, &asset) {
+            return Err(AdminError::ProtectedBalanceViolation);
+        }
+
+        // Per-ledger withdrawal limit
+        if let Some(max_sweep) = storage::get_max_sweep_per_ledger(&env) {
+            let now = env.ledger().sequence();
+            let last_sweep = storage::get_last_sweep_ledger(&env);
+            let mut cumulative = 0i128;
+            if last_sweep == Some(now) {
+                cumulative = storage::get_cumulative_swept_this_ledger(&env);
+            }
+            let new_cumulative = cumulative
+                .checked_add(amount)
+                .ok_or(AdminError::SweepLedgerLimitExceeded)?;
+            if new_cumulative > max_sweep {
+                return Err(AdminError::SweepLedgerLimitExceeded);
+            }
+            storage::set_last_sweep_ledger(&env, now);
+            storage::set_cumulative_swept_this_ledger(&env, new_cumulative);
+        }
+
+        // Effects then interaction (CEI).
+        ledger::record_sweep(&env, &asset, amount).map_err(|_| AdminError::ProtectedBalanceViolation)?;
+        crate::token::sweep_asset(&env, &asset, &to, amount);
+
+        TreasurySwept {
+            asset,
+            to,
+            amount,
+            at_ledger: env.ledger().sequence(),
+        }
+        .publish(&env);
+        admin::emit_admin_action(&env, &admin, "admin_sweep");
         Ok(())
     }
 
