@@ -62,7 +62,7 @@ pub enum PolicyError {
     InvalidRegion = 121,
     /// KYC whitelist is enabled and the holder is not in the whitelist.
     NotWhitelisted = 122,
-    /// Deductible value is invalid (negative or exceeds coverage).
+    /// Deductible value is invalid (negative or ≥ coverage; must satisfy `0 <= d < coverage`).
     InvalidDeductible = 123,
     /// Treasury balance is insufficient to cover projected claim obligations.
     InsufficientSolvency = 124,
@@ -77,6 +77,9 @@ pub enum PolicyError {
     /// The global voter registry has reached its configured maximum.
     /// No additional voters can be registered until some are removed.
     VoterRegistryFull = 128,
+    /// Holder has not approved this contract to spend enough of the policy asset
+    /// to cover the computed premium (pre-flight check before `transfer_from`).
+    InsufficientAllowance = 129,
 }
 
 #[contracttype]
@@ -373,6 +376,12 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::VoterRegistryCapExceeded => {
             "batch would push the global voter registry past its configured maximum"
         }
+        Error::VoterRegistryFull => {
+            "global voter registry is full; remove voters before registering more"
+        }
+        Error::CorruptSnapshotEntry => {
+            "claim voter snapshot has a corrupt (zero/negative) voting-power entry"
+        }
     };
 
     QuoteFailure {
@@ -433,6 +442,18 @@ pub fn check_solvency_ratio(env: &Env, asset: &Address, new_coverage: i128) -> b
 /// `asset` must be on the admin-controlled allowlist at call time.
 /// The asset is bound to the policy and used for both premium payment
 /// and future claim payouts — no cross-asset settlement in MVP.
+///
+/// # Duplicate-coverage rule
+/// A holder **cannot** hold two *active* policies of the same `policy_type`
+/// and `region` whose ledger windows overlap (half-open `[start, end)`).
+/// Different types, different regions, or adjacent (non-overlapping) windows
+/// are allowed. This blocks double-payout on a single loss event.
+///
+/// # Counters
+/// On success: premium is transferred exactly once, the holder's policy
+/// counter and optional nonce are incremented, active-policy count / voter
+/// registry are updated, and coverage is tracked via the holder's active
+/// policy weight (reserved against solvency checks at bind time).
 #[allow(clippy::too_many_arguments)]
 pub fn initiate_policy(
     env: &Env,
@@ -501,6 +522,9 @@ pub fn initiate_policy(
     storage::check_and_bump_nonce(env, &holder, expected_nonce)
         .map_err(|_| PolicyError::NonceMismatch)?;
 
+    // Metadata URI: non-empty, max length, allowed scheme (ipfs:// or https://).
+    validate::validate_metadata_uri(&metadata_uri).map_err(|_| PolicyError::InvalidMetadataUri)?;
+
     let input = RiskInput {
         region: region.clone(),
         age_band: age_band.clone(),
@@ -531,7 +555,9 @@ pub fn initiate_policy(
         None => None,
         Some(0) => None,
         Some(d) if d < 0 => return Err(PolicyError::InvalidDeductible),
-        Some(d) if d > base_amount => return Err(PolicyError::InvalidDeductible),
+        // Product rule: 0 <= deductible < coverage (equal to coverage would
+        // leave a zero net payout on a full-limit claim).
+        Some(d) if d >= base_amount => return Err(PolicyError::InvalidDeductible),
         Some(d) => Some(d),
     };
 
@@ -777,17 +803,15 @@ pub fn set_beneficiary(
     Ok(())
 }
 
-/// Admin-only: update the policy metadata URI. Must be non-empty.
+/// Admin-only: update the policy metadata URI.
+/// Uses the same validation as bind: non-empty, ≤ max length, `ipfs://` or `https://`.
 pub fn update_policy_metadata_uri(
     env: &Env,
     holder: Address,
     policy_id: u32,
     new_uri: String,
 ) -> Result<(), PolicyError> {
-    // Validate new_uri is non-empty
-    if new_uri.is_empty() {
-        return Err(PolicyError::InvalidMetadataUri);
-    }
+    validate::validate_metadata_uri(&new_uri).map_err(|_| PolicyError::InvalidMetadataUri)?;
 
     let mut policy = storage::get_policy(env, &holder, policy_id).ok_or(PolicyError::NotFound)?;
 
@@ -1048,8 +1072,24 @@ fn coverage_tier_rank(tier: &CoverageType) -> u32 {
 
 /// Transfer policy ownership to a new holder.
 ///
-/// - Authenticated by the current holder.
-/// - Reverts if `new_holder` equals the current holder or if any claim is open.
+/// # Authorization
+/// Requires **both** `holder.require_auth()` and `new_holder.require_auth()` so
+/// ownership (and future claim payouts) cannot move without the recipient's consent.
+///
+/// # Guards
+/// - Reverts if `new_holder` is zero, equals the current holder, the policy is
+///   inactive, or any claim is open on this policy.
+///
+/// # Indexes / voters
+/// Moves the persistent policy key, updates the status index, decrements the
+/// old holder's active-policy count (and drops them from the voter registry if
+/// they have no remaining active policies), and registers the new holder.
+///
+/// # History preserved
+/// Does **not** reset `strike_count`, deductible, beneficiary, terms_hash,
+/// coverage window fields (other than holder/id), or off-key claim history.
+/// Claim records stay keyed to the filing claimant; transfer is blocked while
+/// an open claim exists so in-flight filings are not orphaned mid-vote.
 pub fn transfer_policy(
     env: &Env,
     holder: &Address,
@@ -1057,8 +1097,16 @@ pub fn transfer_policy(
     new_holder: &Address,
 ) -> Result<(), Error> {
     holder.require_auth();
+    new_holder.require_auth();
 
     if holder == new_holder {
+        return Err(Error::PolicyTransferInvalid);
+    }
+    let zero = Address::from_string(&soroban_sdk::String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    if *new_holder == zero {
         return Err(Error::PolicyTransferInvalid);
     }
 
@@ -1073,14 +1121,40 @@ pub fn transfer_policy(
         return Err(Error::PolicyTransferInvalid);
     }
 
-    // Move storage: write under new holder key, remove old key
+    let strike_count = policy.strike_count;
+    let old_policy = policy.clone();
+
+    // Allocate a fresh per-holder id under the recipient to avoid colliding
+    // with an existing (new_holder, policy_id) key.
+    let new_id = storage::next_policy_id(env, new_holder);
     policy.holder = new_holder.clone();
-    storage::set_policy(env, new_holder, policy_id, &policy);
+    policy.policy_id = new_id;
+    // Explicitly preserve strike history (and all other fields by clone).
+    policy.strike_count = strike_count;
+
+    storage::set_policy(env, new_holder, new_id, &policy);
     env.storage()
         .persistent()
         .remove(&storage::DataKey::Policy(holder.clone(), policy_id));
 
-    events::emit_policy_transferred(env, policy_id, holder, new_holder);
+    // Status index: remove old key, add new key.
+    storage::unindex_policy_by_status(
+        env,
+        &storage::compute_policy_status(&old_policy, env.ledger().sequence()),
+        &crate::types::PolicyLookupKey {
+            holder: holder.clone(),
+            policy_id,
+        },
+    );
+    storage::index_new_policy(env, new_holder, new_id, &policy);
+
+    storage::decrement_holder_active_policies(env, holder);
+    if storage::get_holder_active_policy_count(env, holder) == 0 {
+        storage::voters_remove_holder(env, holder);
+    }
+    storage::add_voter(env, new_holder)?;
+
+    events::emit_policy_transferred(env, new_id, holder, new_holder);
 
     Ok(())
 }
