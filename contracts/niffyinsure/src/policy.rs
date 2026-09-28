@@ -77,6 +77,8 @@ pub enum PolicyError {
     /// The global voter registry has reached its configured maximum.
     /// No additional voters can be registered until some are removed.
     VoterRegistryFull = 128,
+    /// Holder token allowance is insufficient for the required premium transfer.
+    InsufficientAllowance = 129,
 }
 
 #[contracttype]
@@ -373,6 +375,8 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::VoterRegistryCapExceeded => {
             "batch would push the global voter registry past its configured maximum"
         }
+        Error::VoterRegistryFull => "global voter registry has reached its configured maximum",
+        Error::CorruptSnapshotEntry => "claim voter snapshot contains a corrupt power entry",
     };
 
     QuoteFailure {
@@ -1076,9 +1080,7 @@ pub fn transfer_policy(
     // Move storage: write under new holder key, remove old key
     policy.holder = new_holder.clone();
     storage::set_policy(env, new_holder, policy_id, &policy);
-    env.storage()
-        .persistent()
-        .remove(&storage::DataKey::Policy(holder.clone(), policy_id));
+    storage::remove_policy(env, holder, policy_id);
 
     events::emit_policy_transferred(env, policy_id, holder, new_holder);
 

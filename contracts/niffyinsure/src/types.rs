@@ -12,15 +12,6 @@ pub const IMAGE_URL_MAX_LEN: u32 = 128;
 pub const MAX_EVIDENCE_URL_BYTES: u32 = 2048;
 /// Default evidence attachment limit when admin config is unset.
 pub const IMAGE_URLS_MAX: u32 = 5;
-/// Maximum byte length of a single evidence URL accepted by `file_claim`.
-///
-/// Rationale: Soroban host functions cap total invocation argument size, and
-/// `Vec<ClaimEvidenceEntry>` is passed inline in every `file_claim` call. An
-/// unbounded (or very long) URL string multiplies storage cost per claim and
-/// pushes a batch of evidence entries toward the Soroban argument size limit.
-/// 128 bytes comfortably fits IPFS CIDs and allowlisted gateway URLs while
-/// keeping per-claim storage cost predictable.
-pub const MAX_EVIDENCE_URL_BYTES: u32 = 128;
 pub const REASON_MAX_LEN: u32 = 128;
 pub const SAFETY_SCORE_MAX: u32 = 100;
 
@@ -402,6 +393,17 @@ pub const CLAIM_BATCH_GET_MAX: u32 = PAGE_SIZE_MAX;
 pub struct PolicyLookupKey {
     pub holder: Address,
     pub policy_id: u32,
+}
+
+/// Ledger boundaries for a single claim's commit-reveal cycle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitRevealPhases {
+    /// Last ledger (inclusive) during which commitments are accepted.
+    pub commit_phase_end_ledger: u32,
+    /// Last ledger (inclusive) during which reveals are accepted.
+    /// Must be strictly greater than `commit_phase_end_ledger`.
+    pub reveal_phase_end_ledger: u32,
 }
 
 /// Lightweight policy summary returned by `list_policies`.
@@ -819,8 +821,8 @@ pub struct PremiumQuote {
 
 /// Human-readable identity information returned by `get_contract_metadata`.
 ///
-/// All fields are compile-time constants; no storage reads occur on the call path.
-/// Safe to call via simulation without authentication.
+/// After `initialize`, includes the live admin, treasury token, and init ledger.
+/// Safe to call via simulation without authentication once initialized.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractMetadata {
@@ -828,6 +830,9 @@ pub struct ContractMetadata {
     pub version: String,
     /// Short hint identifying the target Stellar network (non-binding, for tooling convenience).
     pub network_passphrase_hint: String,
+    pub admin: Address,
+    pub token: Address,
+    pub init_ledger: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

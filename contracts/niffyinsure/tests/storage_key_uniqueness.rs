@@ -36,6 +36,7 @@ fn all_unit_variants(env: &Env) -> Vec<DataKey> {
         DataKey::PendingAdmin,
         DataKey::PendingAdminExpiry,
         DataKey::Token,
+        DataKey::InitLedger,
         DataKey::Treasury,
         DataKey::ProtocolFeeBps,
         DataKey::FeeRecipient,
@@ -88,6 +89,8 @@ fn all_unit_variants(env: &Env) -> Vec<DataKey> {
         DataKey::MinCoverageAmount,
         DataKey::MaxVotersPerClaim,
         DataKey::ClaimFilingFee,
+        DataKey::CalcExpectedVersion,
+        DataKey::CalcLastAbiVersion,
     ]
 }
 

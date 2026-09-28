@@ -98,48 +98,28 @@ pub trait PremiumCalculatorTrait {
 
 // ── Calculator versioning ─────────────────────────────────────────────────────
 
-/// Storage key for the expected calculator ABI version.
-/// When set, every cross-contract call asserts the calculator's `abi_version()`
-/// matches this value before proceeding.
-const CALC_EXPECTED_VERSION_KEY: &str = "calc_exp_ver";
-
-/// Storage key for the ABI version observed on the last successful `compute`.
-const CALC_LAST_ABI_VERSION_KEY: &str = "calc_last_abi";
-
 /// Store the expected calculator ABI version in instance storage.
 pub fn set_expected_calc_version(env: &Env, version: u32) {
-    env.storage().instance().set(
-        &soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY),
-        &version,
-    );
+    storage::set_expected_calc_version(env, version);
 }
 
 /// Read the expected calculator ABI version (None = version check disabled).
 pub fn get_expected_calc_version(env: &Env) -> Option<u32> {
-    env.storage()
-        .instance()
-        .get(&soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY))
+    storage::get_expected_calc_version(env)
 }
 
 /// Remove the expected calculator ABI version (disables version check).
 pub fn clear_expected_calc_version(env: &Env) {
-    env.storage()
-        .instance()
-        .remove(&soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY));
+    storage::clear_expected_calc_version(env);
 }
 
 fn set_last_calc_abi_version(env: &Env, version: u32) {
-    env.storage().instance().set(
-        &soroban_sdk::Symbol::new(env, CALC_LAST_ABI_VERSION_KEY),
-        &version,
-    );
+    storage::set_last_calc_abi_version(env, version);
 }
 
 /// ABI version from the last successful external calculator `compute`, if any.
 pub fn get_last_calc_abi_version(env: &Env) -> Option<u32> {
-    env.storage()
-        .instance()
-        .get(&soroban_sdk::Symbol::new(env, CALC_LAST_ABI_VERSION_KEY))
+    storage::get_last_calc_abi_version(env)
 }
 
 /// Admin helper: atomically update the calculator contract address and expected ABI version.

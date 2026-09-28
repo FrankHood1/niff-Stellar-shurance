@@ -482,7 +482,7 @@ pub fn file_claim(
 /// between **successful** `file_claim` calls is reverted to the pre-filing anchor so a
 /// mistaken filing does not force the holder to wait another full window before refiling.
 pub fn withdraw_claim(env: &Env, claimant: &Address, claim_id: u64) -> Result<(), Error> {
-    storage::assert_claims_not_paused(env);
+    // Intentionally NOT pause-gated: users must be able to withdraw during any pause.
 
     let mut claim = storage::get_claim(env, claim_id).ok_or(Error::ClaimNotFound)?;
 
