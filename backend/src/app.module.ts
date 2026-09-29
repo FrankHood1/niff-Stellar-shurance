@@ -36,6 +36,7 @@ import { AppLoggerService } from './common/logger/app-logger.service';
 import { OracleHooksController } from './experimental/oracle-hooks.controller';
 import { BetaCalculatorsController } from './experimental/beta-calculators.controller';
 import { XdrDecodeController } from './experimental/xdr-decode.controller';
+import { PingController } from './routes/ping.controller';
 import { IdempotencyMiddleware } from './common/middleware/idempotency.middleware';
 import { DeprecationHeadersInterceptor } from './common/versioning/deprecation-headers.interceptor';
 import { V1SunsetInterceptor } from './common/versioning/v1-sunset.interceptor';
@@ -100,7 +101,7 @@ const IDEMPOTENCY_ROUTES = [
     AssetsModule,
     PostsModule,
   ],
-  controllers: [OracleHooksController, BetaCalculatorsController, XdrDecodeController],
+  controllers: [OracleHooksController, BetaCalculatorsController, XdrDecodeController, PingController],
   providers: [
     RequestContextMiddleware,
     AppLoggerService,
