@@ -160,7 +160,7 @@ pub enum Error {
     VoterRegistryCapExceeded = 89,
     /// Individual voter registration would exceed [`storage::MAX_ELIGIBLE_VOTERS`].
     VoterRegistryFull = 90,
-    /// Claim voter snapshot contains a corrupt (zero/negative) power entry.
+    /// Snapshot voting-power entry is zero or negative (corrupt data).
     CorruptSnapshotEntry = 91,
 }
 

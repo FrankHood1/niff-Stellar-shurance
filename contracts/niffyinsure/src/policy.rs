@@ -1,7 +1,7 @@
 use crate::{
-    events, ledger, premium, storage, token,
+    calculator, events, ledger, premium, storage, token,
     types::{
-        AgeBand, CoverageTier, CoverageType, Policy, PolicyType, PremiumQuote, RegionTier,
+        AgeBand, CoverageTier, CoverageType, Policy, PolicyType, QuoteResult, RegionTier,
         RiskInput, STRIKE_DEACTIVATION_THRESHOLD,
     },
     validate::{self, Error},
@@ -77,7 +77,7 @@ pub enum PolicyError {
     /// The global voter registry has reached its configured maximum.
     /// No additional voters can be registered until some are removed.
     VoterRegistryFull = 128,
-    /// Holder token allowance is insufficient for the required premium transfer.
+    /// Holder has not approved enough allowance for the premium transfer.
     InsufficientAllowance = 129,
 }
 
@@ -184,16 +184,22 @@ pub struct PolicyRenewed {
 ///
 /// **`renew_policy` on an expired policy:** the call returns [`crate::types::RenewPolicyOutcome::Lapsed`]
 /// in **`Ok`** (not `Err`) so this event and idempotency storage are not rolled back.
+/// Read-only premium quote. Performs **no persistent storage writes** so the
+/// backend can call via RPC simulation for free.
+///
+/// Validates coverage against `min_coverage_amount`, optional asset claim bounds,
+/// and (when the policy-type registry is enabled) that at least one active type
+/// exists. Routes through the calculator with fail-open local fallback.
 pub fn generate_premium(
     env: &Env,
     region: RegionTier,
     age_band: AgeBand,
     coverage_type: CoverageTier,
     safety_score: u32,
-    base_amount: i128,
+    coverage: i128,
     include_breakdown: bool,
     asset: Option<&Address>,
-) -> Result<PremiumQuote, validate::Error> {
+) -> Result<QuoteResult, validate::Error> {
     let input = RiskInput {
         region,
         age_band,
@@ -202,32 +208,66 @@ pub fn generate_premium(
     };
 
     validate::check_risk_input(&input)?;
-    if base_amount <= 0 {
+    validate_quote_coverage(env, coverage, asset)?;
+
+    let (quote, calc_source) = calculator::compute_quote_readonly(
+        env,
+        &input,
+        coverage,
+        include_breakdown,
+        QUOTE_TTL_LEDGERS,
+        asset,
+    )?;
+
+    Ok(QuoteResult {
+        premium: quote.total_premium,
+        coverage,
+        asset: asset.cloned(),
+        table_version: quote.config_version,
+        calc_source,
+    })
+}
+
+/// Validate coverage amount for quoting: floor, optional asset bounds, registry sanity.
+fn validate_quote_coverage(
+    env: &Env,
+    coverage: i128,
+    asset: Option<&Address>,
+) -> Result<(), validate::Error> {
+    if coverage <= 0 {
         return Err(validate::Error::InvalidBaseAmount);
     }
+    let min_coverage = storage::get_min_coverage_amount(env);
+    if coverage < min_coverage {
+        return Err(validate::Error::ClaimBelowMinAmount);
+    }
 
-    let table = match asset {
-        Some(a) => premium::get_table_for_asset(env, a),
-        None => storage::get_multiplier_table(env),
-    };
-    let computation = premium::compute_premium(&input, base_amount, &table)?;
-    let line_items = if include_breakdown {
-        Some(premium::build_line_items(env, &computation))
-    } else {
-        None
-    };
+    if let Some(a) = asset {
+        if !storage::is_allowed_asset(env, a) {
+            return Err(validate::Error::InvalidAsset);
+        }
+        if let Some(bounds) = storage::get_allowed_asset_config(env, a) {
+            if coverage < bounds.min_claim_amount {
+                return Err(validate::Error::ClaimBelowMinAmount);
+            }
+            if coverage > bounds.max_claim_amount {
+                return Err(validate::Error::ClaimAboveMaxAmount);
+            }
+        }
+    }
 
-    let current_ledger = env.ledger().sequence();
-    let valid_until_ledger = current_ledger
-        .checked_add(QUOTE_TTL_LEDGERS)
-        .ok_or(validate::Error::Overflow)?;
+    // Policy-type registry: when enabled, refuse quotes if the registry has been
+    // turned on but no types remain active (misconfiguration).
+    if storage::is_policy_type_registry_enabled(env) {
+        let any_active = [PolicyType::Auto, PolicyType::Health, PolicyType::Property]
+            .iter()
+            .any(|pt| storage::is_policy_type_active(env, pt));
+        if !any_active {
+            return Err(validate::Error::PolicyInactive);
+        }
+    }
 
-    Ok(PremiumQuote {
-        total_premium: computation.total_premium,
-        line_items,
-        valid_until_ledger,
-        config_version: computation.config_version,
-    })
+    Ok(())
 }
 
 pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
@@ -337,8 +377,12 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::PayoutRecipientContractNotAllowlisted => {
             "contract payout recipient is not on the allowlist"
         }
-        Error::ClaimBelowMinAmount => "claim amount is below the asset-specific minimum",
-        Error::ClaimAboveMaxAmount => "claim amount exceeds the asset-specific maximum",
+        Error::ClaimBelowMinAmount => {
+            "coverage/claim amount is below the configured minimum (min_coverage or asset bound)"
+        }
+        Error::ClaimAboveMaxAmount => {
+            "coverage/claim amount exceeds the asset-specific maximum"
+        }
         Error::DelegationInvalid => "delegation not found or expired",
         Error::DelegationPermissionDenied => "operator lacks required delegation permission",
         Error::NoReinsuranceConfigured => {
@@ -375,8 +419,12 @@ pub fn map_quote_error(env: &Env, err: Error) -> QuoteFailure {
         Error::VoterRegistryCapExceeded => {
             "batch would push the global voter registry past its configured maximum"
         }
-        Error::VoterRegistryFull => "global voter registry has reached its configured maximum",
-        Error::CorruptSnapshotEntry => "claim voter snapshot contains a corrupt power entry",
+        Error::VoterRegistryFull => {
+            "global voter registry is full; remove voters before registering more"
+        }
+        Error::CorruptSnapshotEntry => {
+            "claim voter snapshot has a corrupt (zero/negative) voting-power entry"
+        }
     };
 
     QuoteFailure {
