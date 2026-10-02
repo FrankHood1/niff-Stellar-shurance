@@ -14,6 +14,12 @@ pub const MAX_EVIDENCE_URL_BYTES: u32 = 2048;
 pub const IMAGE_URLS_MAX: u32 = 5;
 pub const REASON_MAX_LEN: u32 = 128;
 pub const SAFETY_SCORE_MAX: u32 = 100;
+/// Max byte length for `metadata_uri` on bind / admin update.
+///
+/// Sized for `ipfs://…` CIDs and short `https://` document URLs while staying
+/// well under Soroban argument-size pressure when packed into
+/// [`InitiatePolicyOptions`].
+pub const MAX_METADATA_URI_BYTES: u32 = 256;
 
 // ── Rejection side-effect thresholds ─────────────────────────────────────────
 //
@@ -372,6 +378,10 @@ pub enum PauseReason {
 /// a cursor pointing past the last item simply returns an empty page — it
 /// never panics or skips records.
 pub const PAGE_SIZE_MAX: u32 = 20;
+
+/// Hard cap on `policy_ids` processed per `process_expired` call.
+/// Matches [`PAGE_SIZE_MAX`] so keepers stay within simulation budgets.
+pub const PROCESS_EXPIRED_MAX: u32 = PAGE_SIZE_MAX;
 
 /// Maximum `(holder, policy_id)` pairs in a single `get_policies_batch` call.
 ///

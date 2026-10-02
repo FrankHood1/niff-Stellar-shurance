@@ -221,7 +221,7 @@ pub fn check_policy(policy: &Policy) -> Result<(), Error> {
         return Err(Error::InvalidLedgerWindow);
     }
     if let Some(d) = policy.deductible {
-        if d < 0 || d > policy.coverage {
+        if d < 0 || d >= policy.coverage {
             // No free `contracterror` slots: treat misconfigured deductible as overflow-style limits.
             return Err(Error::Overflow);
         }
@@ -577,6 +577,25 @@ pub fn validate_evidence_url(env: &Env, url: &String) -> Result<(), Error> {
         }
     }
 
+    Err(Error::InvalidEvidenceUrl)
+}
+
+/// Validate policy `metadata_uri`: non-empty, ≤ [`MAX_METADATA_URI_BYTES`], and
+/// scheme is `ipfs://` or `https://` (case-sensitive ASCII prefix).
+///
+/// Returns `Ok(())` on success. Callers map failures to
+/// [`crate::policy::PolicyError::InvalidMetadataUri`].
+pub fn validate_metadata_uri(uri: &String) -> Result<(), Error> {
+    if uri.is_empty() {
+        return Err(Error::InvalidEvidenceUrl);
+    }
+    if uri.len() > crate::types::MAX_METADATA_URI_BYTES {
+        return Err(Error::EvidenceUrlTooLong);
+    }
+    let bytes = uri.to_bytes();
+    if bytes_has_prefix(&bytes, b"ipfs://") || bytes_has_prefix(&bytes, b"https://") {
+        return Ok(());
+    }
     Err(Error::InvalidEvidenceUrl)
 }
 

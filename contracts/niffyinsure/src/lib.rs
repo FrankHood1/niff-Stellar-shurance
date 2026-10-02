@@ -1374,6 +1374,13 @@ impl NiffyInsure {
     }
 
     /// Read-only: retrieve a persisted policy by (holder, policy_id).
+    ///
+    /// **TTL:** This and the other policy read entrypoints (`get_policies_batch`,
+    /// `list_policies`, `get_policy_counter`, `has_policy`, `get_active_policy_count`,
+    /// `holder_active_policy_count`, `get_inactive_policies`, `get_nonce`) perform
+    /// storage **gets only** and do **not** bump persistent TTLs. TTL extension is
+    /// reserved for mutating paths and dedicated keeper bump helpers so read-only
+    /// RPC/simulation traffic cannot extend ledger rent.
     pub fn get_policy(env: Env, holder: Address, policy_id: u32) -> Option<types::Policy> {
         storage::get_policy(&env, &holder, policy_id)
     }
@@ -1558,26 +1565,46 @@ impl NiffyInsure {
         storage::get_policy_expired_event_end_ledger(&env, &holder, policy_id)
     }
 
-    /// Keeper hook: when `ledger_sequence >= policy.end_ledger`, emit [`policy::PolicyExpired`]
-    /// once per policy term (see `policy` module docs for notification delay). Reverts if the
-    /// policy does not exist or is not yet expired.
+    /// Keeper hook: process expired policies for `holder`.
+    ///
+    /// `policy_ids` is bounded to [`types::PROCESS_EXPIRED_MAX`]; excess IDs are
+    /// ignored (silent clamp) so keepers stay within simulation budgets.
+    ///
+    /// **Idempotent:** already-inactive / already-notified policies succeed as
+    /// no-ops. IDs that are not yet at `end_ledger` (event path) or not past
+    /// `end + grace` (deactivation path) are skipped without failing the batch.
+    /// Missing IDs are skipped. Returns the number of IDs that reached the
+    /// deactivation / expiry-notification path successfully.
     pub fn process_expired(
         env: Env,
         holder: Address,
-        policy_id: u32,
-    ) -> Result<(), policy::PolicyError> {
-        // Record expiry event when now >= end_ledger (even during grace period).
-        // Deactivate when now >= end + grace (after grace period ends).
-        let result = policy::process_expired(&env, holder.clone(), policy_id);
-        // Also attempt lifecycle deactivation; ignore NotYetExpired (still in grace).
-        let _ = policy_lifecycle::process_expired(&env, holder, policy_id).map_err(|e| match e {
-            policy_lifecycle::PolicyError::PolicyNotFound => policy::PolicyError::NotFound,
-            policy_lifecycle::PolicyError::PolicyLapseNotReached => {
-                policy::PolicyError::NotYetExpired
+        policy_ids: Vec<u32>,
+    ) -> Result<u32, policy::PolicyError> {
+        let cap = (policy_ids.len() as u32).min(types::PROCESS_EXPIRED_MAX);
+        let mut processed: u32 = 0;
+        for i in 0..cap {
+            let policy_id = policy_ids.get(i).unwrap();
+            // Record expiry event when now >= end_ledger (even during grace).
+            match policy::process_expired(&env, holder.clone(), policy_id) {
+                Ok(()) => {}
+                Err(policy::PolicyError::NotFound) => continue,
+                Err(policy::PolicyError::NotYetExpired) => continue,
+                Err(e) => return Err(e),
             }
-            _ => policy::PolicyError::NotYetExpired,
-        });
-        result
+            // Deactivate when now >= end + grace; ignore "not yet lapsed".
+            match policy_lifecycle::process_expired(&env, holder.clone(), policy_id) {
+                Ok(()) => {
+                    processed = processed.saturating_add(1);
+                }
+                Err(policy_lifecycle::PolicyError::PolicyNotFound) => {}
+                Err(policy_lifecycle::PolicyError::PolicyLapseNotReached) => {
+                    // Event may have been recorded while still in grace.
+                    processed = processed.saturating_add(1);
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(processed)
     }
 
     /// Renew before `end_ledger` (renewal window). If already expired, emits [`policy::PolicyExpired`]
@@ -1613,8 +1640,10 @@ impl NiffyInsure {
         policy_lifecycle::terminate_policy(&env, holder, policy_id, reason)
     }
 
-    /// Transfer policy ownership to `new_holder`. Authenticated by current holder.
-    /// Reverts if an open claim exists or `new_holder == holder`.
+    /// Transfer policy ownership to `new_holder`.
+    /// Requires **both** current holder and new holder auth. Reverts if an open
+    /// claim exists, the policy is inactive, or `new_holder == holder`.
+    /// Does not reset `strike_count` or claim history (see `policy::transfer_policy`).
     pub fn transfer_policy(
         env: Env,
         holder: Address,
