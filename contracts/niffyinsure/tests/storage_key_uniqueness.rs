@@ -44,6 +44,8 @@ fn all_unit_variants(env: &Env) -> Vec<DataKey> {
         DataKey::PremiumTable,
         DataKey::CalcAddress,
         DataKey::Voters,
+        DataKey::VoterBucketCount,
+        DataKey::VoterRegistryLen,
         DataKey::ClaimCounter,
         DataKey::Paused,
         DataKey::PauseReason,
@@ -102,6 +104,8 @@ fn all_parameterised_variants(env: &Env) -> Vec<DataKey> {
     vec![
         DataKey::AllowedAsset(za.clone()),
         DataKey::ActivePolicyCount(za.clone()),
+        DataKey::VoterBucket(0),
+        DataKey::VoterMember(za.clone()),
         DataKey::LastClaimResolvedLedger(za.clone(), 0),
         DataKey::PolicyExpiredEventEndLedger(za.clone(), 0),
         DataKey::Policy(za.clone(), 0),
@@ -143,6 +147,7 @@ fn all_parameterised_variants(env: &Env) -> Vec<DataKey> {
         DataKey::Subscription(0),
         DataKey::OwnerSubscriptionIds(za.clone()),
         DataKey::AssetDecimals(za.clone()),
+        DataKey::AssetLedger(za.clone()),
     ]
 }
 

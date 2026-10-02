@@ -78,12 +78,12 @@ pub const QUORUM_BPS_MAX: u32 = 10_000;
 /// One full turn-out / 100% weight in bps (used in the quorum formula below).
 pub const QUORUM_BPS_DENOMINATOR: u32 = 10_000;
 
-/// Absolute maximum protocol fee in basis points.
-pub const PROTOCOL_FEE_BPS_MAX: u32 = 1_000;
+/// Absolute maximum protocol fee in basis points (20%).
+pub const PROTOCOL_FEE_BPS_MAX: u32 = 2_000;
 
-/// Solvency threshold bounds in basis points. `100_000` = 1,000%.
+/// Solvency threshold bounds in basis points. `10_000` = 100%.
 pub const MIN_SOLVENCY_RATIO_BPS_MIN: u32 = 0;
-pub const MIN_SOLVENCY_RATIO_BPS_MAX: u32 = 100_000;
+pub const MIN_SOLVENCY_RATIO_BPS_MAX: u32 = 10_000;
 
 /// Hard cap on `page_size` for `get_inactive_policies`.
 pub const INACTIVE_POLICIES_PAGE_SIZE_MAX: u32 = 20;

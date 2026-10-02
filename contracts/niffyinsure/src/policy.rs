@@ -617,17 +617,9 @@ pub fn initiate_policy(
 
     let fee_bps = storage::get_protocol_fee_bps(env);
     let fee_recipient = storage::get_fee_recipient(env);
-    let fee_amount = if fee_bps == 0 {
-        0
-    } else {
-        premium_amount
-            .checked_mul(fee_bps as i128)
-            .ok_or(PolicyError::PremiumOverflow)?
-            / 10_000
-    };
-    let treasury_amount = premium_amount
-        .checked_sub(fee_amount)
-        .ok_or(PolicyError::PremiumOverflow)?;
+    let (treasury_amount, fee_amount) =
+        crate::premium_pure::split_premium(premium_amount, fee_bps)
+            .map_err(|_| PolicyError::PremiumOverflow)?;
 
     // Pre-flight allowance check (before any state changes): surface a
     // friendly `InsufficientAllowance` error instead of letting the
@@ -697,7 +689,8 @@ pub fn initiate_policy(
     }
 
     // Premium transfer: holder -> treasury and fee recipient using the policy's bound asset.
-    // Done BEFORE any durable writes so failure leaves no partial state.
+    // CEI: collect_premium_with_fee updates internal ledger counters before SEP-41 calls.
+    // Soroban aborts the whole frame on transfer failure, so no partial policy state persists.
     token::collect_premium_with_fee(
         env,
         &holder,
@@ -706,6 +699,11 @@ pub fn initiate_policy(
         &fee_recipient,
         fee_amount,
     );
+    // Reserve coverage against the asset ledger so sweeps cannot undercut liabilities.
+    ledger::reserve_coverage(env, &asset, base_amount).map_err(|e| match e {
+        validate::Error::Overflow => PolicyError::PremiumOverflow,
+        _ => PolicyError::InsufficientSolvency,
+    })?;
 
     let current_ledger = env.ledger().sequence();
     let end_ledger = current_ledger
