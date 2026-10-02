@@ -116,35 +116,23 @@ const CALC_EXPECTED_VERSION_KEY: &str = "calc_exp_ver";
 const CALC_LAST_ABI_VERSION_KEY: &str = "calc_last_abi";
 
 pub fn set_expected_calc_version(env: &Env, version: u32) {
-    env.storage().instance().set(
-        &soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY),
-        &version,
-    );
+    storage::set_expected_calc_version(env, version);
 }
 
 pub fn get_expected_calc_version(env: &Env) -> Option<u32> {
-    env.storage()
-        .instance()
-        .get(&soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY))
+    storage::get_expected_calc_version(env)
 }
 
 pub fn clear_expected_calc_version(env: &Env) {
-    env.storage()
-        .instance()
-        .remove(&soroban_sdk::Symbol::new(env, CALC_EXPECTED_VERSION_KEY));
+    storage::clear_expected_calc_version(env);
 }
 
 fn set_last_calc_abi_version(env: &Env, version: u32) {
-    env.storage().instance().set(
-        &soroban_sdk::Symbol::new(env, CALC_LAST_ABI_VERSION_KEY),
-        &version,
-    );
+    storage::set_last_calc_abi_version(env, version);
 }
 
 pub fn get_last_calc_abi_version(env: &Env) -> Option<u32> {
-    env.storage()
-        .instance()
-        .get(&soroban_sdk::Symbol::new(env, CALC_LAST_ABI_VERSION_KEY))
+    storage::get_last_calc_abi_version(env)
 }
 
 /// Admin helper: atomically update the calculator contract address and expected ABI version.

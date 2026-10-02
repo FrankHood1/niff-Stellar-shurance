@@ -1,3 +1,31 @@
+//! Centralized Soroban storage accessors.
+//!
+//! **Invariant:** this module is the *only* production module that may call
+//! `env.storage()`. All other modules must go through the typed getters/setters
+//! below. A lint-style unit test (`storage_access_lint`) enforces the rule.
+//!
+//! # Storage tiers
+//!
+//! | Tier | Keys | Notes |
+//! |------|------|-------|
+//! | **Instance** | Admin, Token, Pause*, counters, config | Loaded on every call — keep small |
+//! | **Persistent** | Policy, Claim, Vote, indexes | Long-lived; bumped on every write/hot read |
+//! | **Temporary** | HolderNonce, short-lived locks | Cheap; expire unless refreshed |
+//!
+//! # Pause matrix (operation × flag)
+//!
+//! | Operation | global | bind | claims |
+//! |-----------|--------|------|--------|
+//! | Reads / metadata | ✅ | ✅ | ✅ |
+//! | `withdraw_claim` | ✅ | ✅ | ✅ |
+//! | `initiate_policy` / renew / bind | ❌ | ❌ | ✅ |
+//! | `file_claim` / vote / finalize / payout | ❌ | ✅ | ❌ |
+//! | Admin pause/unpause / rotation | ✅ | ✅ | ✅ |
+//!
+//! ✅ = allowed, ❌ = blocked when that flag is set. Global pause blocks bind
+//! and claims groups; reads and `withdraw_claim` stay available so users are
+//! not trapped.
+
 use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 use crate::ledger;
@@ -11,19 +39,24 @@ use crate::validate;
 ///
 /// # TTL Management Strategy
 ///
-/// Soroban persistent storage entries expire when their TTL reaches zero.
+/// Derived from Stellar's ~5s ledger close time (`ledger::SECS_PER_LEDGER`):
+/// - 1 day  ≈ 17_280 ledgers
+/// - 1 week ≈ 120_960 ledgers
+/// - 1 year ≈ 6_307_200 ledgers
+///
+/// Soroban persistent/instance entries expire when their TTL reaches zero.
 /// This contract uses a systematic approach to prevent data loss:
 ///
 /// ## Constants and Their Relationships
 ///
-/// - `PERSISTENT_TTL_THRESHOLD` (100,000 ledgers ~ 5.8 days): When remaining TTL
-///   falls below this threshold, `extend_ttl` operations will extend the entry.
-///
-/// - `PERSISTENT_TTL_EXTEND_TO` (6,000,000 ledgers ~ 1 year): Target TTL after
-///   extension. Provides ~12x buffer over maximum policy duration (518,400 ledgers ~ 30 days).
-///
-/// - `DEFAULT_TTL_ALERT_THRESHOLD` (600,000 ledgers ~ 1 month): Default alert
-///   threshold for TTL expiry notifications (10% of PERSISTENT_TTL_EXTEND_TO).
+/// - `INSTANCE_BUMP` / `PERSISTENT_BUMP` (= `PERSISTENT_TTL_EXTEND_TO`,
+///   6,000,000 ledgers ≈ 347 days @ 5s): target live TTL after every bump.
+/// - `PERSISTENT_TTL_THRESHOLD` (100,000 ledgers ≈ 5.8 days): when remaining TTL
+///   falls below this, `extend_ttl` re-extends toward the bump target.
+/// - `TEMPORARY_BUMP` (172_800 ledgers ≈ 10 days): short-lived nonce/lock TTL.
+/// - `TEMPORARY_TTL_THRESHOLD` (17_280 ledgers ≈ 1 day): temporary extend gate.
+/// - `DEFAULT_TTL_ALERT_THRESHOLD` (600,000 ledgers ≈ 1 month): default alert
+///   threshold for TTL expiry notifications (10% of PERSISTENT bump).
 ///
 /// ## Policy Duration Relationship
 ///
@@ -44,6 +77,20 @@ use crate::validate;
 pub const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
 /// Target TTL after extension (in ledgers, ~1 year).
 pub const PERSISTENT_TTL_EXTEND_TO: u32 = 6_000_000;
+
+/// Instance-storage bump target (ledgers). Same magnitude as persistent —
+/// instance is loaded on every call, so we keep it alive for a full year.
+pub const INSTANCE_BUMP: u32 = PERSISTENT_TTL_EXTEND_TO;
+/// Persistent-storage bump target (ledgers). Alias of [`PERSISTENT_TTL_EXTEND_TO`].
+pub const PERSISTENT_BUMP: u32 = PERSISTENT_TTL_EXTEND_TO;
+/// Temporary-storage bump target (~10 days @ 5s/ledger) for nonces/locks.
+pub const TEMPORARY_BUMP: u32 = 172_800;
+/// Temporary extend threshold (~1 day @ 5s/ledger).
+pub const TEMPORARY_TTL_THRESHOLD: u32 = 17_280;
+
+/// Hard cap on policies per holder. Unbounded `Vec` growth in a single entry
+/// is not allowed; counters + paginated reads replace per-holder lists.
+pub const MAX_POLICIES_PER_HOLDER: u32 = 256;
 
 // ── Claim voter snapshot TTL (persistent `ClaimVoters`) ───────────────────────
 //
@@ -66,6 +113,15 @@ pub const CLAIM_VOTER_SNAPSHOT_EXTEND_TO: u32 =
 // ── DataKey ───────────────────────────────────────────────────────────────────
 
 /// Exhaustive enumeration of every storage key used by the contract.
+///
+/// ## Instance-tier keys (loaded on every call — keep the set small)
+///
+/// `Admin`, `PendingAdmin`, `PendingAdminExpiry`, `Token`, `Treasury`,
+/// `ProtocolFeeBps`, `FeeRecipient`, `MinSolvencyRatioBps`, `PremiumTable`,
+/// `CalcAddress`, `Voters`, `ClaimCounter`, `Paused`, `PauseReason`,
+/// `PendingAdminAction`, sweep/governance config, role admins, `InitLedger`,
+/// and other unit config flags. Do **not** put per-policy or per-claim payloads
+/// in instance storage.
 #[contracttype]
 pub enum DataKey {
     // ── Instance tier ────────────────────────────────────────────────────
@@ -74,6 +130,8 @@ pub enum DataKey {
     /// Expiry ledger for pending admin proposal (time lock).
     PendingAdminExpiry,
     Token,
+    /// Ledger sequence at which `initialize` succeeded (instance).
+    InitLedger,
     /// Address where collected premiums are sent.
     Treasury,
     /// Basis-point protocol fee deducted from each premium payment.
@@ -307,20 +365,35 @@ pub fn set_open_claim(env: &Env, holder: &Address, policy_id: u32, open: bool) {
 pub fn bump_instance(env: &Env) {
     env.storage()
         .instance()
-        .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        .extend_ttl(PERSISTENT_TTL_THRESHOLD, INSTANCE_BUMP);
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
+pub fn has_admin(env: &Env) -> bool {
+    env.storage().instance().has(&DataKey::Admin)
+}
+
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+    bump_instance(env);
+}
+
+pub fn try_get_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Admin)
 }
 
 pub fn get_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .expect("contract not initialised: admin missing")
+    try_get_admin(env).expect("contract not initialised: admin missing")
+}
+
+pub fn set_init_ledger(env: &Env, ledger: u32) {
+    env.storage().instance().set(&DataKey::InitLedger, &ledger);
+    bump_instance(env);
+}
+
+pub fn get_init_ledger(env: &Env) -> Option<u32> {
+    env.storage().instance().get(&DataKey::InitLedger)
 }
 
 pub fn set_pending_admin(env: &Env, pending: &Address) {
@@ -561,10 +634,15 @@ pub fn get_grace_period_ledgers(env: &Env) -> u32 {
 
 pub fn set_calc_address(env: &Env, addr: &Address) {
     env.storage().instance().set(&DataKey::CalcAddress, addr);
+    bump_instance(env);
 }
 
 pub fn get_calc_address(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::CalcAddress)
+}
+
+pub fn clear_calc_address(env: &Env) {
+    env.storage().instance().remove(&DataKey::CalcAddress);
 }
 
 // ── Premium table ─────────────────────────────────────────────────────────────
@@ -599,52 +677,64 @@ pub fn is_allowed_asset(env: &Env, asset: &Address) -> bool {
 // PAUSE SYSTEM
 //
 // Granular pause flags for operational flexibility:
-//   - bind_paused: blocks new policy initiation/renewal
-//   - claims_paused: blocks filing claims and voting
+//   - global: blocks bind + claims groups (reads + withdraw_claim stay up)
+//   - bind:   blocks new policy initiation/renewal
+//   - claims: blocks filing claims, voting, and payouts
 //
-// Read-only methods continue to work for transparency.
-// Admin-triggered payouts (process_claim) continue during pause to avoid trapping funds.
+// See module-level pause matrix docs above.
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Pause flags: separate controls for binding new policies vs filing claims.
-/// Both false by default (unpaused state).
+/// Which operation group an entrypoint belongs to for pause checks.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PauseScope {
+    /// Policy bind / renew / initiate.
+    Bind = 0,
+    /// Claim filing, voting, finalize, payout.
+    Claims = 1,
+    /// Anything blocked by a global pause (bind ∪ claims).
+    Global = 2,
+}
+
+/// Pause flags: global + separate bind/claims controls.
+/// All false by default (unpaused state).
 #[contracttype]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PauseFlags {
+    pub global: bool,
     pub bind_paused: bool,
     pub claims_paused: bool,
 }
 
-/// Central assertion: panics if ANY pause flag is set.
-/// Use for entrypoints that should be blocked by any pause.
-pub fn assert_not_paused(env: &Env) {
-    if is_paused(env) {
+/// Central assertion: panics when `scope` is blocked by the active flags.
+pub fn assert_not_paused(env: &Env, scope: PauseScope) {
+    let flags = get_pause_flags(env);
+    let blocked = match scope {
+        PauseScope::Bind => flags.global || flags.bind_paused,
+        PauseScope::Claims => flags.global || flags.claims_paused,
+        PauseScope::Global => flags.global || flags.bind_paused || flags.claims_paused,
+    };
+    if blocked {
         panic!("protocol paused for maintenance");
     }
 }
 
 /// Assertion for policy binding operations (initiate/renew policy).
-/// Only blocks if bind_paused is true.
 pub fn assert_bind_not_paused(env: &Env) {
-    let flags = get_pause_flags(env);
-    if flags.bind_paused {
-        panic!("protocol paused for maintenance: policy binding disabled");
-    }
+    assert_not_paused(env, PauseScope::Bind);
 }
 
 /// Assertion for claim operations (file claim, vote, finalize).
-/// Only blocks if claims_paused is true.
+/// Does **not** apply to `withdraw_claim` (always available).
 pub fn assert_claims_not_paused(env: &Env) {
-    let flags = get_pause_flags(env);
-    if flags.claims_paused {
-        panic!("protocol paused for maintenance: claims disabled");
-    }
+    assert_not_paused(env, PauseScope::Claims);
 }
 
-/// Get current pause state (legacy compatibility - returns true if ANY flag is set).
+/// Returns true if any pause flag is set.
 pub fn is_paused(env: &Env) -> bool {
     let flags = get_pause_flags(env);
-    flags.bind_paused || flags.claims_paused
+    flags.global || flags.bind_paused || flags.claims_paused
 }
 
 /// Get detailed pause flags.
@@ -655,18 +745,21 @@ pub fn get_pause_flags(env: &Env) -> PauseFlags {
         .unwrap_or_default()
 }
 
-/// Set full pause state (legacy compatibility - sets both flags).
+/// Set full pause state (legacy: sets global + bind + claims together).
 pub fn set_paused(env: &Env, paused: bool) {
     let flags = PauseFlags {
+        global: paused,
         bind_paused: paused,
         claims_paused: paused,
     };
     env.storage().instance().set(&DataKey::Paused, &flags);
+    bump_instance(env);
 }
 
 /// Set granular pause flags.
 pub fn set_pause_flags(env: &Env, flags: &PauseFlags) {
     env.storage().instance().set(&DataKey::Paused, flags);
+    bump_instance(env);
 }
 
 /// Set the pause reason. Pass `None` to clear (on unpause).
@@ -960,7 +1053,7 @@ pub fn set_voters(env: &Env, voters: &Vec<Address>) {
 ///
 /// Reverts with [`crate::validate::Error::VoterRegistryFull`] when the registry
 /// is already at [`MAX_ELIGIBLE_VOTERS`].
-pub fn add_voter(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+pub fn add_voter(env: &Env, holder: &Address) -> Result<(), crate::validate::Error> {
     let mut voters = get_voters(env);
     let mut found = false;
     for v in voters.iter() {
@@ -998,7 +1091,7 @@ pub fn get_holder_active_policy_count(env: &Env, holder: &Address) -> u32 {
     get_active_policy_count(env, holder)
 }
 
-pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), crate::validate::Error> {
     let mut voters = get_voters(env);
     let mut found = false;
     for v in voters.iter() {
@@ -1196,10 +1289,13 @@ pub fn get_policy_counter(env: &Env, holder: &Address) -> u32 {
 pub fn next_policy_id(env: &Env, holder: &Address) -> u32 {
     let key = DataKey::PolicyCounter(holder.clone());
     let next: u32 = env.storage().persistent().get(&key).unwrap_or(0u32) + 1;
+    if next > MAX_POLICIES_PER_HOLDER {
+        panic!("max policies per holder exceeded");
+    }
     env.storage().persistent().set(&key, &next);
     env.storage()
         .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_BUMP);
     next
 }
 
@@ -1216,13 +1312,26 @@ pub fn set_policy(env: &Env, holder: &Address, policy_id: u32, policy: &Policy) 
     env.storage().persistent().set(&key, policy);
     env.storage()
         .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_BUMP);
 }
 
 pub fn get_policy(env: &Env, holder: &Address, policy_id: u32) -> Option<Policy> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Policy(holder.clone(), policy_id))
+    let key = DataKey::Policy(holder.clone(), policy_id);
+    let policy = env.storage().persistent().get(&key);
+    if policy.is_some() {
+        // Hot read: keep active policies alive.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_BUMP);
+    }
+    policy
+}
+
+pub fn remove_policy(env: &Env, holder: &Address, policy_id: u32) {
+    let key = DataKey::Policy(holder.clone(), policy_id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
 }
 
 // ── Issue #812: Policy status index (persistent) ─────────────────────────────
@@ -1385,11 +1494,18 @@ pub fn set_claim(env: &Env, claim: &Claim) {
     env.storage().persistent().set(&key, claim);
     env.storage()
         .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_BUMP);
 }
 
 pub fn get_claim(env: &Env, claim_id: u64) -> Option<Claim> {
-    env.storage().persistent().get(&DataKey::Claim(claim_id))
+    let key = DataKey::Claim(claim_id);
+    let claim = env.storage().persistent().get(&key);
+    if claim.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_BUMP);
+    }
+    claim
 }
 
 // ── Vote (persistent) ─────────────────────────────────────────────────────────
@@ -1979,7 +2095,7 @@ pub fn set_policy_expired_event_end_ledger(
 
 pub fn get_holder_nonce(env: &Env, holder: &Address) -> u64 {
     env.storage()
-        .persistent()
+        .temporary()
         .get(&DataKey::HolderNonce(holder.clone()))
         .unwrap_or(0u64)
 }
@@ -1990,10 +2106,10 @@ pub fn increment_holder_nonce(env: &Env, holder: &Address) -> u64 {
         .checked_add(1)
         .unwrap_or_else(|| panic!("holder nonce overflow"));
     let key = DataKey::HolderNonce(holder.clone());
-    env.storage().persistent().set(&key, &next);
+    env.storage().temporary().set(&key, &next);
     env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        .temporary()
+        .extend_ttl(&key, TEMPORARY_TTL_THRESHOLD, TEMPORARY_BUMP);
     next
 }
 
@@ -2171,15 +2287,17 @@ pub fn bump_policy_ttl(env: &Env, holder: &Address, policy_id: u32) -> bool {
     env.storage().persistent().extend_ttl(
         &policy_key,
         PERSISTENT_TTL_THRESHOLD,
-        PERSISTENT_TTL_EXTEND_TO,
+        PERSISTENT_BUMP,
     );
 
     let counter_key = DataKey::PolicyCounter(holder.clone());
-    env.storage().persistent().extend_ttl(
-        &counter_key,
-        PERSISTENT_TTL_THRESHOLD,
-        PERSISTENT_TTL_EXTEND_TO,
-    );
+    if env.storage().persistent().has(&counter_key) {
+        env.storage().persistent().extend_ttl(
+            &counter_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_BUMP,
+        );
+    }
 
     true
 }

@@ -395,6 +395,17 @@ pub struct PolicyLookupKey {
     pub policy_id: u32,
 }
 
+/// Ledger boundaries for a single claim's commit-reveal cycle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitRevealPhases {
+    /// Last ledger (inclusive) during which commitments are accepted.
+    pub commit_phase_end_ledger: u32,
+    /// Last ledger (inclusive) during which reveals are accepted.
+    /// Must be strictly greater than `commit_phase_end_ledger`.
+    pub reveal_phase_end_ledger: u32,
+}
+
 /// Lightweight policy summary returned by `list_policies`.
 ///
 /// Omits large or rarely-needed fields (`details`, `evidence`, etc.) to keep
@@ -834,8 +845,8 @@ pub struct PremiumQuote {
 
 /// Human-readable identity information returned by `get_contract_metadata`.
 ///
-/// All fields are compile-time constants; no storage reads occur on the call path.
-/// Safe to call via simulation without authentication.
+/// After `initialize`, includes the live admin, treasury token, and init ledger.
+/// Safe to call via simulation without authentication once initialized.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractMetadata {
@@ -843,6 +854,9 @@ pub struct ContractMetadata {
     pub version: String,
     /// Short hint identifying the target Stellar network (non-binding, for tooling convenience).
     pub network_passphrase_hint: String,
+    pub admin: Address,
+    pub token: Address,
+    pub init_ledger: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -1126,9 +1126,7 @@ pub fn transfer_policy(
     // Move storage: write under new holder key, remove old key
     policy.holder = new_holder.clone();
     storage::set_policy(env, new_holder, policy_id, &policy);
-    env.storage()
-        .persistent()
-        .remove(&storage::DataKey::Policy(holder.clone(), policy_id));
+    storage::remove_policy(env, holder, policy_id);
 
     events::emit_policy_transferred(env, policy_id, holder, new_holder);
 

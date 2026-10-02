@@ -71,6 +71,8 @@ pub enum AdminError {
     SweepLedgerLimitExceeded = 124,
     /// Max sweep per ledger value is out of allowed bounds.
     MaxSweepPerLedgerOutOfBounds = 125,
+    /// Contract has not been initialized yet.
+    NotInitialized = 126,
 }
 
 /// Payload for a treasury-rotation proposal.
@@ -202,9 +204,10 @@ struct AdminAccepted {
     pub new_admin: Address,
 }
 
-#[contractevent(topics = ["niffyinsure", "admin_cancelled"])]
+/// Emitted when the current admin cancels a pending rotation proposal.
+#[contractevent(topics = ["niffyinsure", "admin_proposal_cancelled"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AdminCancelled {
+struct AdminProposalCancelled {
     pub current_admin: Address,
     pub cancelled_pending: Address,
 }
@@ -285,12 +288,10 @@ struct EmergencySweepExecuted {
 
 /// Load the stored admin address and call `require_auth()` on it.
 /// Auth is against the *stored* address — parameter spoofing cannot satisfy it.
+/// Returns a typed [`AdminError::NotInitialized`] when `initialize` has not run.
 pub fn require_admin(env: &Env) -> Address {
-    let admin = env
-        .storage()
-        .instance()
-        .get::<_, Address>(&storage::DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(env, AdminError::Unauthorized));
+    let admin = storage::try_get_admin(env)
+        .unwrap_or_else(|| panic_with_error!(env, AdminError::NotInitialized));
     admin.require_auth();
     admin
 }
@@ -329,10 +330,8 @@ pub enum RoleError {
 /// Returns the authorised address.
 pub fn require_pause_admin(env: &Env) -> Address {
     let role = storage::get_pause_admin(env).unwrap_or_else(|| {
-        env.storage()
-            .instance()
-            .get::<_, Address>(&storage::DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RoleError::Unauthorized))
+        storage::try_get_admin(env)
+            .unwrap_or_else(|| panic_with_error!(env, AdminError::NotInitialized))
     });
     role.require_auth();
     role
@@ -342,10 +341,8 @@ pub fn require_pause_admin(env: &Env) -> Address {
 /// Returns the authorised address.
 pub fn require_treasury_admin(env: &Env) -> Address {
     let role = storage::get_treasury_admin(env).unwrap_or_else(|| {
-        env.storage()
-            .instance()
-            .get::<_, Address>(&storage::DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RoleError::Unauthorized))
+        storage::try_get_admin(env)
+            .unwrap_or_else(|| panic_with_error!(env, AdminError::NotInitialized))
     });
     role.require_auth();
     role
@@ -355,10 +352,8 @@ pub fn require_treasury_admin(env: &Env) -> Address {
 /// Returns the authorised address.
 pub fn require_param_admin(env: &Env) -> Address {
     let role = storage::get_param_admin(env).unwrap_or_else(|| {
-        env.storage()
-            .instance()
-            .get::<_, Address>(&storage::DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, RoleError::Unauthorized))
+        storage::try_get_admin(env)
+            .unwrap_or_else(|| panic_with_error!(env, AdminError::NotInitialized))
     });
     role.require_auth();
     role
@@ -520,16 +515,21 @@ pub fn accept_admin(env: &Env) {
 
 /// Cancel a pending admin proposal. Current admin must authorize.
 pub fn cancel_admin(env: &Env) {
+    cancel_admin_proposal(env);
+}
+
+/// Alias matching the public two-step rotation API name.
+pub fn cancel_admin_proposal(env: &Env) {
     let current = require_admin(env);
     let pending = storage::get_pending_admin(env)
         .unwrap_or_else(|| panic_with_error!(env, AdminError::NoPendingAdmin));
     storage::clear_pending_admin(env);
-    AdminCancelled {
+    AdminProposalCancelled {
         current_admin: current.clone(),
         cancelled_pending: pending,
     }
     .publish(env);
-    emit_admin_action(env, &current, "cancel_admin");
+    emit_admin_action(env, &current, "cancel_admin_proposal");
 }
 
 /// Update the treasury token contract address. Admin must authorize.

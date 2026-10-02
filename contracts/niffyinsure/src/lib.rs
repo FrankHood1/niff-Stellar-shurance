@@ -161,8 +161,29 @@ struct PauseToggled {
     /// Numeric reason code derived from `PauseReason` (0=SecurityIncident, 1=UpgradePending,
     /// 2=SolvencyRisk, 3=Regulatory). On unpause this field is 0 (reason cleared).
     pub reason_code: u32,
+    pub global: bool,
     pub bind_paused: bool,
     pub claims_paused: bool,
+}
+
+/// Scope code for Paused / Unpaused events: 0=global, 1=bind, 2=claims.
+#[contractevent(topics = ["niffyinsure", "paused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PausedEvent {
+    #[topic]
+    pub admin: Address,
+    /// 0 = global, 1 = bind, 2 = claims
+    pub scope: u32,
+    pub reason_code: u32,
+}
+
+#[contractevent(topics = ["niffyinsure", "unpaused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnpausedEvent {
+    #[topic]
+    pub admin: Address,
+    /// 0 = global (full unpause), 1 = bind, 2 = claims
+    pub scope: u32,
 }
 
 #[contractevent(topics = ["niffyinsure", "protocol_fee_updated"])]
@@ -286,13 +307,14 @@ impl NiffyInsure {
     /// seed the default premium table so quote generation is deterministic.
     pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), InitError> {
         admin.require_auth();
-        if env.storage().instance().has(&storage::DataKey::Admin) {
+        if storage::has_admin(&env) {
             return Err(InitError::AlreadyInitialized);
         }
         admin::require_non_zero_addr(&env, &admin);
         admin::require_non_zero_addr(&env, &token);
         storage::set_admin(&env, &admin);
         storage::set_token(&env, &token);
+        storage::set_init_ledger(&env, env.ledger().sequence());
         storage::set_multiplier_table(&env, &premium::default_multiplier_table(&env));
         storage::set_allowed_asset(&env, &token, true);
         storage::set_protocol_fee_bps(&env, 0);
@@ -315,13 +337,16 @@ impl NiffyInsure {
         soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 
-    /// Returns human-readable contract identity: name, version, and network hint.
-    /// All fields are compile-time constants. No storage reads, no auth required.
+    /// Returns contract identity used by backend and deploy tooling:
+    /// version, admin, token, and the ledger at which `initialize` ran.
     pub fn get_contract_metadata(env: Env) -> types::ContractMetadata {
         types::ContractMetadata {
             name: soroban_sdk::String::from_str(&env, env!("CARGO_PKG_NAME")),
             version: soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION")),
             network_passphrase_hint: soroban_sdk::String::from_str(&env, "Stellar Testnet"),
+            admin: storage::get_admin(&env),
+            token: storage::get_token(&env),
+            init_ledger: storage::get_init_ledger(&env).unwrap_or(0),
         }
     }
 
@@ -621,7 +646,7 @@ impl NiffyInsure {
         commit_reveal::set_phases(
             &env,
             claim_id,
-            &commit_reveal::CommitRevealPhases {
+            &types::CommitRevealPhases {
                 commit_phase_end_ledger,
                 reveal_phase_end_ledger,
             },
@@ -1091,9 +1116,7 @@ impl NiffyInsure {
         let admin = storage::get_admin(&env);
         admin.require_auth();
         admin::check_and_update_gov_cooldown(&env);
-        env.storage()
-            .instance()
-            .remove(&storage::DataKey::CalcAddress);
+        storage::clear_calc_address(&env);
         calculator::clear_expected_calc_version(&env);
         admin::emit_admin_action(&env, &admin, "clear_calculator");
     }
@@ -1635,6 +1658,11 @@ impl NiffyInsure {
         admin::cancel_admin(&env);
     }
 
+    /// Alias for [`Self::cancel_admin`] (two-step rotation API name).
+    pub fn cancel_admin_proposal(env: Env) {
+        admin::cancel_admin_proposal(&env);
+    }
+
     // ── Role management (Issue #1161) ─────────────────────────────────────────
 
     /// Set the dedicated pause-admin address. Only the main admin can call this.
@@ -1984,10 +2012,10 @@ impl NiffyInsure {
     // Read-only methods continue to work for transparency.
     // ═════════════════════════════════════════════════════════════════════════════
 
-    /// Pause the contract with a structured reason.
+    /// Pause the contract with a structured reason (sets global + bind + claims).
     ///
     /// `reason` is stored on-chain so incident responders can read it via simulation
-    /// without authentication. Emits `PauseToggled` with the reason code.
+    /// without authentication. Emits `Paused` and `PauseToggled` with the reason code.
     pub fn pause(env: Env, admin: Address, reason: types::PauseReason) {
         admin.require_auth();
         let stored_admin = storage::get_admin(&env);
@@ -1997,10 +2025,17 @@ impl NiffyInsure {
 
         let flags = storage::get_pause_flags(&env);
         let reason_code = pause_reason_to_code(&reason);
+        PausedEvent {
+            admin: admin.clone(),
+            scope: 0,
+            reason_code,
+        }
+        .publish(&env);
         PauseToggled {
             admin: admin.clone(),
             paused: true,
             reason_code,
+            global: flags.global,
             bind_paused: flags.bind_paused,
             claims_paused: flags.claims_paused,
         }
@@ -2009,20 +2044,25 @@ impl NiffyInsure {
     }
 
     /// Unpause the contract. Clears the stored pause reason.
-    /// Emits `PauseToggled` with `paused=false` and `reason_code=0`.
+    /// Emits `Unpaused` and `PauseToggled` with `paused=false` and `reason_code=0`.
     pub fn unpause(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin = storage::get_admin(&env);
         assert!(admin == stored_admin, "only admin can unpause");
         storage::set_paused(&env, false);
-        // Clear the pause reason on unpause.
         storage::set_pause_reason(&env, None);
 
         let flags = storage::get_pause_flags(&env);
+        UnpausedEvent {
+            admin: admin.clone(),
+            scope: 0,
+        }
+        .publish(&env);
         PauseToggled {
             admin: admin.clone(),
             paused: false,
             reason_code: 0,
+            global: flags.global,
             bind_paused: flags.bind_paused,
             claims_paused: flags.claims_paused,
         }
@@ -2042,10 +2082,17 @@ impl NiffyInsure {
         storage::set_pause_reason(&env, Some(reason.clone()));
 
         let reason_code = pause_reason_to_code(&reason);
+        PausedEvent {
+            admin: admin.clone(),
+            scope: 1,
+            reason_code,
+        }
+        .publish(&env);
         PauseToggled {
             admin: admin.clone(),
             paused: true,
             reason_code,
+            global: flags.global,
             bind_paused: flags.bind_paused,
             claims_paused: flags.claims_paused,
         }
@@ -2065,10 +2112,17 @@ impl NiffyInsure {
         storage::set_pause_reason(&env, Some(reason.clone()));
 
         let reason_code = pause_reason_to_code(&reason);
+        PausedEvent {
+            admin: admin.clone(),
+            scope: 2,
+            reason_code,
+        }
+        .publish(&env);
         PauseToggled {
             admin: admin.clone(),
             paused: true,
             reason_code,
+            global: flags.global,
             bind_paused: flags.bind_paused,
             claims_paused: flags.claims_paused,
         }
