@@ -304,16 +304,16 @@ impl NiffyInsure {
     pub fn generate_premium(
         env: Env,
         input: types::RiskInput,
-        base_amount: i128,
+        coverage: i128,
         include_breakdown: bool,
-    ) -> Result<types::PremiumQuote, validate::Error> {
+    ) -> Result<types::QuoteResult, validate::Error> {
         policy::generate_premium(
             &env,
             input.region,
             input.age_band,
             input.coverage,
             input.safety_score,
-            base_amount,
+            coverage,
             include_breakdown,
             None,
         )
@@ -324,17 +324,17 @@ impl NiffyInsure {
     pub fn generate_premium_for_asset(
         env: Env,
         input: types::RiskInput,
-        base_amount: i128,
+        coverage: i128,
         include_breakdown: bool,
         asset: Address,
-    ) -> Result<types::PremiumQuote, validate::Error> {
+    ) -> Result<types::QuoteResult, validate::Error> {
         policy::generate_premium(
             &env,
             input.region,
             input.age_band,
             input.coverage,
             input.safety_score,
-            base_amount,
+            coverage,
             include_breakdown,
             Some(&asset),
         )
@@ -391,8 +391,11 @@ impl NiffyInsure {
             53 => validate::Error::ClaimNotProcessing,
             54 => validate::Error::RollingClaimCapExceeded,
             55 => validate::Error::PayoutDeadlineNotReached,
-            56 => validate::Error::InsufficientEvidence,
-            57 => validate::Error::CooldownActive,
+            56 => validate::Error::ClaimBelowMinAmount,
+            57 => validate::Error::ClaimAboveMaxAmount,
+            69 => validate::Error::InsufficientEvidence,
+            70 => validate::Error::CooldownActive,
+            73 => validate::Error::CalculatorVersionMismatch,
             80 => validate::Error::DuplicateEvidence,
             81 => validate::Error::PageSizeTooLarge,
             86 => validate::Error::EvidenceUrlTooLong,
