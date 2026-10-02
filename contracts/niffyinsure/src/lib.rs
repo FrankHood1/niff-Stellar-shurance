@@ -188,6 +188,62 @@ struct MinSolvencyRatioUpdated {
     pub new_bps: u32,
 }
 
+/// Unified config change event required by protocol parameter issues.
+/// `old` / `new` are String-encoded prior/new values (decimal for numeric keys,
+/// strkey for addresses).
+#[contractevent(topics = ["niffyinsure", "config_updated"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfigUpdated {
+    #[topic]
+    pub key: String,
+    pub old: String,
+    pub new: String,
+}
+
+fn encode_u32(env: &Env, value: u32) -> String {
+    let mut buf = [0u8; 10];
+    let mut n = value;
+    if n == 0 {
+        return String::from_str(env, "0");
+    }
+    let mut i = 10usize;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    String::from_str(env, core::str::from_utf8(&buf[i..]).unwrap())
+}
+
+fn encode_i128(env: &Env, value: i128) -> String {
+    if value == 0 {
+        return String::from_str(env, "0");
+    }
+    let negative = value < 0;
+    let mut n = if negative { -value } else { value };
+    let mut buf = [0u8; 41];
+    let mut i = 41usize;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    if negative {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    String::from_str(env, core::str::from_utf8(&buf[i..]).unwrap())
+}
+
+fn emit_config_updated(env: &Env, key: &str, old: String, new: String) {
+    ConfigUpdated {
+        key: String::from_str(env, key),
+        old,
+        new,
+    }
+    .publish(env);
+}
+
 #[contractevent(topics = ["niffyinsure", "treasury_depositor_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreasuryDepositorUpdated {
@@ -732,6 +788,12 @@ impl NiffyInsure {
             new_bps: fee_bps,
         }
         .publish(&env);
+        emit_config_updated(
+            &env,
+            "protocol_fee_bps",
+            encode_u32(&env, old),
+            encode_u32(&env, fee_bps),
+        );
         Ok(())
     }
 
@@ -743,10 +805,11 @@ impl NiffyInsure {
         let old = storage::get_fee_recipient(&env);
         storage::set_fee_recipient(&env, &recipient);
         FeeRecipientUpdated {
-            old_recipient: old,
-            new_recipient: recipient,
+            old_recipient: old.clone(),
+            new_recipient: recipient.clone(),
         }
         .publish(&env);
+        emit_config_updated(&env, "fee_recipient", old.to_string(), recipient.to_string());
         Ok(())
     }
 
@@ -766,6 +829,12 @@ impl NiffyInsure {
             new_bps: ratio_bps,
         }
         .publish(&env);
+        emit_config_updated(
+            &env,
+            "min_solvency_ratio_bps",
+            encode_u32(&env, old),
+            encode_u32(&env, ratio_bps),
+        );
         Ok(())
     }
 
@@ -970,11 +1039,11 @@ impl NiffyInsure {
     }
 
     pub fn voter_registry_len(env: Env) -> u32 {
-        storage::get_voters(&env).len()
+        storage::voter_registry_len(&env)
     }
 
     pub fn voter_registry_contains(env: Env, holder: Address) -> bool {
-        storage::get_voters(&env).iter().any(|v| v == holder)
+        storage::voter_registry_contains(&env, &holder)
     }
 
     /// Remove an ineligible address from the voter registry.
@@ -2129,6 +2198,12 @@ impl NiffyInsure {
         let old_amount = storage::get_min_coverage_amount(&env);
         storage::set_min_coverage_amount(&env, amount);
         events::emit_min_coverage_amount_updated(&env, &admin, old_amount, amount);
+        emit_config_updated(
+            &env,
+            "min_coverage_amount",
+            encode_i128(&env, old_amount),
+            encode_i128(&env, amount),
+        );
         Ok(())
     }
 
@@ -2629,13 +2704,33 @@ impl NiffyInsure {
             storage::PERSISTENT_TTL_THRESHOLD,
             storage::PERSISTENT_TTL_EXTEND_TO,
         );
-        storage::add_voter(&env, &holder);
+        let _ = storage::add_voter(&env, &holder);
         // Issue #812: index the seeded policy.
         storage::index_new_policy(&env, &holder, policy_id, &policy);
     }
 
     pub fn test_remove_voter(env: Env, holder: Address) {
         storage::remove_voter(&env, &holder);
+    }
+
+    /// Test-only: register `holder` in the voter registry without binding a policy.
+    pub fn test_add_voter(env: Env, holder: Address) -> Result<(), validate::Error> {
+        storage::voters_ensure_holder(&env, &holder)
+    }
+
+    /// Test-only: read the claim voter snapshot.
+    pub fn test_get_claim_voters(env: Env, claim_id: u64) -> Vec<Address> {
+        storage::get_claim_voters(&env, claim_id)
+    }
+
+    /// Test-only: set per-policy last-resolved ledger for cooldown tests.
+    pub fn test_set_last_claim_resolved(
+        env: Env,
+        holder: Address,
+        policy_id: u32,
+        ledger: u32,
+    ) {
+        storage::set_last_claim_resolved_ledger(&env, &holder, policy_id, ledger);
     }
 
     /// Test-only: force a seeded policy's `is_active` flag and `start_ledger`

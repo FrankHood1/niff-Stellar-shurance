@@ -2,7 +2,7 @@ use soroban_sdk::{contracttype, Address, Env, Map, String, Vec};
 
 use crate::ledger;
 use crate::types::{
-    Claim, MultiplierTable, Policy, PolicyLookupKey, PolicyStatus, RollingClaimWindowState,
+    Claim, MultiplierTable, Policy, PolicyLookupKey, RollingClaimWindowState,
     VoteDelegation, VoteOption,
 };
 use crate::validate;
@@ -86,7 +86,16 @@ pub enum DataKey {
     CalcAddress,
     /// Boolean allowlist flag per asset contract address.
     AllowedAsset(Address),
+    /// Legacy single-vec voter registry (migrated once into `VoterBucket`s).
     Voters,
+    /// Fixed-size voter registry bucket (persistent) → `Vec<Address>`.
+    VoterBucket(u32),
+    /// Number of allocated voter buckets (instance; small metadata).
+    VoterBucketCount,
+    /// Membership index for O(1) contains (persistent).
+    VoterMember(Address),
+    /// Cached voter registry length (instance).
+    VoterRegistryLen,
     ClaimCounter,
     Paused,
     /// Active pause reason when the contract is paused.
@@ -690,14 +699,34 @@ pub fn next_claim_id(env: &Env) -> Result<u64, crate::validate::Error> {
     Ok(next)
 }
 
-// ── Voters (instance) ─────────────────────────────────────────────────────────
+// ── Voters (bucketed instance storage) ────────────────────────────────────────
+//
+// # Layout
+// Voters are stored in fixed-size **persistent** buckets (`VoterBucket(i)` of
+// capacity [`VOTER_BUCKET_SIZE`]) plus instance metadata (`VoterBucketCount`,
+// `VoterRegistryLen`) and persistent `VoterMember(Address) -> bool` for O(1)
+// membership. Buckets/members use persistent storage so the instance blob
+// cannot grow without bound as the registry approaches [`MAX_ELIGIBLE_VOTERS`].
+//
+// # Sybil-resistance assumption
+// Eligibility is **one address per active policy holder**: an address enters the
+// registry when it first binds an active policy (or via admin batch), and is
+// removed when its active-policy count hits zero. There is **no** on-chain
+// proof that distinct addresses belong to distinct real-world identities.
+// Known limits: a determined actor can open many wallets and buy cheap policies
+// to inflate voting power; economic cost of premiums and off-chain KYC for
+// large coverage are the only mitigations (see ADR-0002). Caps
+// (`MAX_ELIGIBLE_VOTERS`, `max_voters_per_claim`) bound gas/storage impact, not
+// Sybil identity.
+//
+// # Legacy migration
+// Pre-bucket deployments stored a single `DataKey::Voters` vector. The first
+// registry read/write that observes that key redistributes addresses into
+// buckets and removes the legacy key.
 
-pub fn get_voters(env: &Env) -> Vec<Address> {
-    env.storage()
-        .instance()
-        .get(&DataKey::Voters)
-        .unwrap_or_else(|| Vec::new(env))
-}
+/// Addresses per `VoterBucket` entry. Chosen so ~5 000 voters fit in ~80 buckets
+/// while keeping each entry well under Soroban value-size pressure.
+pub const VOTER_BUCKET_SIZE: u32 = 64;
 
 /// Hard cap on the size of the voter registry. Enforced atomically across an
 /// entire `add_voters_batch` call so a batch that would exceed the cap reverts
@@ -706,65 +735,381 @@ pub fn get_voters(env: &Env) -> Vec<Address> {
 /// # Gas safety rationale
 ///
 /// Soroban charges CPU instructions per storage read and write. An unbounded
-/// voter registry means that `get_voters` (which reads the entire `Vec<Address>`
-/// from persistent storage) and iteration over it during snapshot creation or
-/// finalization would consume an ever-growing share of the per-transaction
-/// instruction budget. At 5 000 entries the worst-case read is still well
-/// within the default Soroban budget (≈ 100 M instructions); beyond that the
-/// cost grows linearly and risks hitting the limit during snapshot creation or
-/// claim finalization loops. The cap is set to 5 000 because:
+/// voter registry means that `get_voters` (which reads every bucket) and
+/// iteration during snapshot creation or finalization would consume an
+/// ever-growing share of the per-transaction instruction budget. At 5 000
+/// entries the worst-case read is still well within the default Soroban budget
+/// (≈ 100 M instructions); beyond that the cost grows linearly and risks
+/// hitting the limit during snapshot creation or claim finalization loops.
+/// The cap is set to 5 000 because:
 ///   - Typical governance protocols have far fewer voters.
-///   - 5 000 addresses × ~200 instructions each ≈ 1 M instructions, leaving
+///   - 5 000 addresses × ~200 instructions each ≈ 1 M instructions, leaving
 ///     ample headroom for the rest of the transaction logic.
 ///   - A larger cap would not meaningfully improve decentralisation but would
 ///     make gas costs unpredictable and risk transaction failure.
 pub const MAX_ELIGIBLE_VOTERS: u32 = 5_000;
+
+fn get_voter_bucket_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::VoterBucketCount)
+        .unwrap_or(0)
+}
+
+fn set_voter_bucket_count(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VoterBucketCount, &count);
+}
+
+fn get_voter_bucket(env: &Env, index: u32) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::VoterBucket(index))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn set_voter_bucket(env: &Env, index: u32, bucket: &Vec<Address>) {
+    let key = DataKey::VoterBucket(index);
+    env.storage().persistent().set(&key, bucket);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+fn remove_voter_bucket(env: &Env, index: u32) {
+    let key = DataKey::VoterBucket(index);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+fn set_voter_member(env: &Env, addr: &Address, present: bool) {
+    let key = DataKey::VoterMember(addr.clone());
+    if present {
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    } else if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+fn voter_member_get(env: &Env, holder: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::VoterMember(holder.clone()))
+        .unwrap_or(false)
+}
+
+fn set_voter_registry_len_raw(env: &Env, len: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VoterRegistryLen, &len);
+}
+
+/// O(1) registry length (maintained by add/remove; refreshed on legacy migrate).
+pub fn voter_registry_len(env: &Env) -> u32 {
+    migrate_legacy_voters_if_needed(env);
+    env.storage()
+        .instance()
+        .get(&DataKey::VoterRegistryLen)
+        .unwrap_or(0)
+}
+
+/// O(1) membership via `VoterMember` index (falls back after migrate).
+pub fn voter_registry_contains(env: &Env, holder: &Address) -> bool {
+    migrate_legacy_voters_if_needed(env);
+    voter_member_get(env, holder)
+}
+
+/// One-shot redistribution of legacy `DataKey::Voters` into buckets.
+fn migrate_legacy_voters_if_needed(env: &Env) {
+    if !env.storage().instance().has(&DataKey::Voters) {
+        return;
+    }
+    let legacy: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Voters)
+        .unwrap_or_else(|| Vec::new(env));
+    env.storage().instance().remove(&DataKey::Voters);
+
+    // Reset bucket state then re-append (legacy vec is already unique).
+    let old_count = get_voter_bucket_count(env);
+    for i in 0..old_count {
+        remove_voter_bucket(env, i);
+    }
+    set_voter_bucket_count(env, 0);
+    set_voter_registry_len_raw(env, 0);
+
+    for addr in legacy.iter() {
+        append_voter_unchecked(env, &addr);
+    }
+}
+
+/// Append without membership/cap checks (caller guarantees uniqueness + headroom).
+fn append_voter_unchecked(env: &Env, holder: &Address) {
+    let bucket_count = get_voter_bucket_count(env);
+    if bucket_count == 0 {
+        let mut bucket = Vec::new(env);
+        bucket.push_back(holder.clone());
+        set_voter_bucket(env, 0, &bucket);
+        set_voter_bucket_count(env, 1);
+    } else {
+        let last = bucket_count - 1;
+        let mut bucket = get_voter_bucket(env, last);
+        if bucket.len() >= VOTER_BUCKET_SIZE {
+            let mut bucket = Vec::new(env);
+            bucket.push_back(holder.clone());
+            set_voter_bucket(env, bucket_count, &bucket);
+            set_voter_bucket_count(env, bucket_count + 1);
+        } else {
+            bucket.push_back(holder.clone());
+            set_voter_bucket(env, last, &bucket);
+        }
+    }
+    set_voter_member(env, holder, true);
+    let len = env
+        .storage()
+        .instance()
+        .get::<_, u32>(&DataKey::VoterRegistryLen)
+        .unwrap_or(0)
+        .saturating_add(1);
+    set_voter_registry_len_raw(env, len);
+}
+
+pub fn get_voters(env: &Env) -> Vec<Address> {
+    migrate_legacy_voters_if_needed(env);
+    let bucket_count = get_voter_bucket_count(env);
+    let mut out = Vec::new(env);
+    for i in 0..bucket_count {
+        let bucket = get_voter_bucket(env, i);
+        for addr in bucket.iter() {
+            out.push_back(addr);
+        }
+    }
+    out
+}
 
 /// Batch-register `addresses` as voters, skipping addresses already present
 /// (in storage or earlier in the same batch) so duplicates cannot corrupt the
 /// registry or double-count. The `MAX_ELIGIBLE_VOTERS` cap is checked against
 /// the final, de-duplicated size of the registry *before* any write happens,
 /// so a batch that would exceed the cap reverts atomically with zero partial
-/// writes, returning [`validate::Error::VoterRegistryFull`].
+/// writes, returning [`crate::validate::Error::VoterRegistryFull`].
 ///
 /// Returns the list of addresses actually added (in call order), which the
 /// caller uses to emit one `VoterAdded` event per address.
-pub fn add_voters_batch(env: &Env, addresses: &Vec<Address>) -> Result<Vec<Address>, validate::Error> {
-    let mut voters = get_voters(env);
+pub fn add_voters_batch(env: &Env, addresses: &Vec<Address>) -> Result<Vec<Address>, crate::validate::Error> {
+    migrate_legacy_voters_if_needed(env);
     let mut to_add: Vec<Address> = Vec::new(env);
 
     for addr in addresses.iter() {
-        let mut already_present = false;
-        for v in voters.iter() {
+        if voter_registry_contains(env, &addr) {
+            continue;
+        }
+        let mut already_in_batch = false;
+        for v in to_add.iter() {
             if v == addr {
-                already_present = true;
+                already_in_batch = true;
                 break;
             }
         }
-        if !already_present {
-            for v in to_add.iter() {
-                if v == addr {
-                    already_present = true;
-                    break;
-                }
-            }
-        }
-        if !already_present {
+        if !already_in_batch {
             to_add.push_back(addr.clone());
         }
     }
 
-    let projected_len = voters.len().saturating_add(to_add.len());
+    let projected_len = voter_registry_len(env).saturating_add(to_add.len());
     if projected_len > MAX_ELIGIBLE_VOTERS {
-        return Err(validate::Error::VoterRegistryFull);
+        return Err(crate::validate::Error::VoterRegistryFull);
     }
 
     for addr in to_add.iter() {
-        voters.push_back(addr.clone());
+        append_voter_unchecked(env, &addr);
     }
-    set_voters(env, &voters);
 
     Ok(to_add)
+}
+
+/// Legacy helper retained for tests that rewrite the full list.
+pub fn set_voters(env: &Env, voters: &Vec<Address>) {
+    migrate_legacy_voters_if_needed(env);
+    // Clear existing buckets + membership.
+    let old_count = get_voter_bucket_count(env);
+    for i in 0..old_count {
+        let bucket = get_voter_bucket(env, i);
+        for addr in bucket.iter() {
+            set_voter_member(env, &addr, false);
+        }
+        remove_voter_bucket(env, i);
+    }
+    set_voter_bucket_count(env, 0);
+    set_voter_registry_len_raw(env, 0);
+    for addr in voters.iter() {
+        if !voter_registry_contains(env, &addr) {
+            append_voter_unchecked(env, &addr);
+        }
+    }
+}
+
+/// Add `holder` to the voter set (if not already present) and increment
+/// their active-policy count by 1.
+///
+/// Reverts with [`crate::validate::Error::VoterRegistryFull`] when the registry
+/// is already at [`MAX_ELIGIBLE_VOTERS`].
+pub fn add_voter(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+    let mut voters = get_voters(env);
+    let mut found = false;
+    for v in voters.iter() {
+        if v == *holder {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
+            return Err(validate::Error::VoterRegistryFull);
+        }
+        append_voter_unchecked(env, holder);
+    }
+
+    let key = DataKey::ActivePolicyCount(holder.clone());
+    let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    env.storage().instance().set(&key, &(count + 1));
+    Ok(())
+}
+
+pub fn increment_holder_active_policies(env: &Env, holder: &Address) {
+    let key = DataKey::ActivePolicyCount(holder.clone());
+    let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
+    env.storage().instance().set(&key, &(count + 1));
+}
+
+pub fn decrement_holder_active_policies(env: &Env, holder: &Address) {
+    let key = DataKey::ActivePolicyCount(holder.clone());
+    let next = get_active_policy_count(env, holder).saturating_sub(1);
+    env.storage().instance().set(&key, &next);
+}
+
+pub fn get_holder_active_policy_count(env: &Env, holder: &Address) -> u32 {
+    get_active_policy_count(env, holder)
+}
+
+pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+    let mut voters = get_voters(env);
+    let mut found = false;
+    for v in voters.iter() {
+        if v == *holder {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
+            return Err(validate::Error::VoterRegistryFull);
+        }
+        append_voter_unchecked(env, holder);
+    }
+    Ok(())
+}
+
+/// Removes `holder` from the voter list (no-op if absent).
+///
+/// Uses swap-with-last within the bucketed layout so removal stays O(buckets)
+/// in storage traffic and never materialises the full registry in one value
+/// (critical near [`MAX_ELIGIBLE_VOTERS`] where a full rewrite exceeds budget).
+pub fn remove_voter(env: &Env, holder: &Address) {
+    migrate_legacy_voters_if_needed(env);
+    if !voter_registry_contains(env, holder) {
+        return;
+    }
+
+    let bucket_count = get_voter_bucket_count(env);
+    let mut found_bucket: Option<u32> = None;
+    let mut found_offset: u32 = 0;
+    for i in 0..bucket_count {
+        let bucket = get_voter_bucket(env, i);
+        for j in 0..bucket.len() {
+            if bucket.get(j).unwrap() == *holder {
+                found_bucket = Some(i);
+                found_offset = j;
+                break;
+            }
+        }
+        if found_bucket.is_some() {
+            break;
+        }
+    }
+    let Some(bi) = found_bucket else {
+        set_voter_member(env, holder, false);
+        return;
+    };
+
+    let last_bi = bucket_count.saturating_sub(1);
+    let last_bucket = get_voter_bucket(env, last_bi);
+    let last_offset = last_bucket.len().saturating_sub(1);
+    let tail = last_bucket.get(last_offset).unwrap();
+
+    if bi == last_bi {
+        // Same-bucket remove: swap with last element (if needed), then pop.
+        let mut bucket = last_bucket;
+        if found_offset != last_offset {
+            bucket.set(found_offset, tail);
+        }
+        let mut truncated = Vec::new(env);
+        for j in 0..last_offset {
+            truncated.push_back(bucket.get(j).unwrap());
+        }
+        if truncated.is_empty() {
+            remove_voter_bucket(env, last_bi);
+            set_voter_bucket_count(env, last_bi);
+        } else {
+            set_voter_bucket(env, last_bi, &truncated);
+        }
+    } else {
+        // Cross-bucket: overwrite target slot with last element, then pop last bucket.
+        let mut target = get_voter_bucket(env, bi);
+        target.set(found_offset, tail);
+        set_voter_bucket(env, bi, &target);
+
+        let mut truncated = Vec::new(env);
+        for j in 0..last_offset {
+            truncated.push_back(last_bucket.get(j).unwrap());
+        }
+        if truncated.is_empty() {
+            remove_voter_bucket(env, last_bi);
+            set_voter_bucket_count(env, last_bi);
+        } else {
+            set_voter_bucket(env, last_bi, &truncated);
+        }
+    }
+
+    set_voter_member(env, holder, false);
+    let len = voter_registry_len(env).saturating_sub(1);
+    set_voter_registry_len_raw(env, len);
+}
+
+pub fn voters_remove_holder(env: &Env, holder: &Address) {
+    remove_voter(env, holder);
+}
+
+/// Returns the number of active policies for `holder` (vote weight).
+pub fn get_active_policy_count(env: &Env, holder: &Address) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ActivePolicyCount(holder.clone()))
+        .unwrap_or(0)
+}
+
+pub fn get_open_claim_count(env: &Env, holder: &Address, policy_id: u32) -> u32 {
+    if has_open_claim(env, holder, policy_id) {
+        1
+    } else {
+        0
+    }
 }
 
 // ── Governance proposals ─────────────────────────────────────────────────────
@@ -814,105 +1159,6 @@ pub fn has_proposal_vote(env: &Env, proposal_id: u64, voter: &Address) -> bool {
     env.storage()
         .persistent()
         .has(&DataKey::ProposalVote(proposal_id, voter.clone()))
-}
-
-pub fn set_voters(env: &Env, voters: &Vec<Address>) {
-    env.storage().instance().set(&DataKey::Voters, voters);
-}
-
-/// Add `holder` to the voter set (if not already present) and increment
-/// their active-policy count by 1.
-///
-/// Reverts with [`validate::Error::VoterRegistryFull`] when the registry
-/// is already at [`MAX_ELIGIBLE_VOTERS`].
-pub fn add_voter(env: &Env, holder: &Address) -> Result<(), validate::Error> {
-    let mut voters = get_voters(env);
-    let mut found = false;
-    for v in voters.iter() {
-        if v == *holder {
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        if voters.len() >= MAX_ELIGIBLE_VOTERS {
-            return Err(validate::Error::VoterRegistryFull);
-        }
-        voters.push_back(holder.clone());
-    }
-    set_voters(env, &voters);
-
-    let key = DataKey::ActivePolicyCount(holder.clone());
-    let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
-    env.storage().instance().set(&key, &(count + 1));
-    Ok(())
-}
-
-pub fn increment_holder_active_policies(env: &Env, holder: &Address) {
-    let key = DataKey::ActivePolicyCount(holder.clone());
-    let count: u32 = env.storage().instance().get(&key).unwrap_or(0);
-    env.storage().instance().set(&key, &(count + 1));
-}
-
-pub fn decrement_holder_active_policies(env: &Env, holder: &Address) {
-    let key = DataKey::ActivePolicyCount(holder.clone());
-    let next = get_active_policy_count(env, holder).saturating_sub(1);
-    env.storage().instance().set(&key, &next);
-}
-
-pub fn get_holder_active_policy_count(env: &Env, holder: &Address) -> u32 {
-    get_active_policy_count(env, holder)
-}
-
-pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), validate::Error> {
-    let mut voters = get_voters(env);
-    let mut found = false;
-    for v in voters.iter() {
-        if v == *holder {
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        if voters.len() >= MAX_ELIGIBLE_VOTERS {
-            return Err(validate::Error::VoterRegistryFull);
-        }
-        voters.push_back(holder.clone());
-        set_voters(env, &voters);
-    }
-    Ok(())
-}
-
-/// Removes `holder` from the voter list (no-op if absent).
-pub fn remove_voter(env: &Env, holder: &Address) {
-    let voters = get_voters(env);
-    let mut updated: Vec<Address> = Vec::new(env);
-    for v in voters.iter() {
-        if v != *holder {
-            updated.push_back(v);
-        }
-    }
-    set_voters(env, &updated);
-}
-
-pub fn voters_remove_holder(env: &Env, holder: &Address) {
-    remove_voter(env, holder);
-}
-
-/// Returns the number of active policies for `holder` (vote weight).
-pub fn get_active_policy_count(env: &Env, holder: &Address) -> u32 {
-    env.storage()
-        .instance()
-        .get(&DataKey::ActivePolicyCount(holder.clone()))
-        .unwrap_or(0)
-}
-
-pub fn get_open_claim_count(env: &Env, holder: &Address, policy_id: u32) -> u32 {
-    if has_open_claim(env, holder, policy_id) {
-        1
-    } else {
-        0
-    }
 }
 
 // ── Policy counter (persistent) ───────────────────────────────────────────────
@@ -1244,16 +1490,81 @@ pub fn delegated_vote_weight(
 }
 
 // ── Claim voters snapshot (persistent) ───────────────────────────────────────
+//
+// # Snapshot construction (`snapshot_claim_voters`)
+// 1. Load the global voter registry in stable bucket order.
+// 2. **Exclude the claimant** (self-vote is never eligible).
+// 3. If the eligible count exceeds `max_voters_per_claim`, deterministically
+//    sample a subset of size `max` seeded by `claim_id`:
+//    - Walk indices `0..eligible.len()` in registry order.
+//    - Use a 64-bit LCG (`state = state * 6364136223846793005 + 1`) seeded
+//      with `claim_id ^ 0x9E3779B97F4A7C15` to run a partial Fisher–Yates
+//      shuffle on the first `max` positions.
+//    - Persist the first `max` addresses after the shuffle.
+// The algorithm is pure (no `Env` randomness) so two nodes replaying the same
+// claim always produce the identical electorate.
 
-pub fn snapshot_claim_voters(env: &Env, claim_id: u64) {
+pub fn snapshot_claim_voters(env: &Env, claim_id: u64, claimant: &Address) {
     let voters = get_voters(env);
+    let mut eligible: Vec<Address> = Vec::new(env);
+    for v in voters.iter() {
+        if v != *claimant {
+            eligible.push_back(v);
+        }
+    }
+
+    let max = get_max_voters_per_claim(env);
+    let selected = if eligible.len() > max {
+        sample_voters_by_claim_id(env, &eligible, max, claim_id)
+    } else {
+        eligible
+    };
+
     let key = DataKey::ClaimVoters(claim_id);
-    env.storage().persistent().set(&key, &voters);
+    env.storage().persistent().set(&key, &selected);
     env.storage().persistent().extend_ttl(
         &key,
         CLAIM_VOTER_SNAPSHOT_TTL_THRESHOLD,
         CLAIM_VOTER_SNAPSHOT_EXTEND_TO,
     );
+}
+
+/// Deterministic subset selection for oversized electorates (see module docs).
+fn sample_voters_by_claim_id(
+    env: &Env,
+    eligible: &Vec<Address>,
+    max: u32,
+    claim_id: u64,
+) -> Vec<Address> {
+    let n = eligible.len();
+    if max == 0 || n == 0 {
+        return Vec::new(env);
+    }
+    let take = max.min(n);
+    // Copy into a working vec for in-place partial Fisher–Yates.
+    let mut work: Vec<Address> = Vec::new(env);
+    for v in eligible.iter() {
+        work.push_back(v);
+    }
+    let mut state = claim_id ^ 0x9E3779B97F4A7C15u64;
+    for i in 0..take {
+        state = state
+            .wrapping_mul(6364136223846793005u64)
+            .wrapping_add(1);
+        let rem = (n - i) as u64;
+        let j = i + (state % rem) as u32;
+        if i != j {
+            let a = work.get(i).unwrap();
+            let b = work.get(j).unwrap();
+            work.set(i, b);
+            work.set(j, a);
+        }
+    }
+    let mut out: Vec<Address> = Vec::new(env);
+    for i in 0..take {
+        out.push_back(work.get(i).unwrap());
+    }
+    out
 }
 
 pub fn set_claim_voters(env: &Env, claim_id: u64, voters: &Vec<Address>) {

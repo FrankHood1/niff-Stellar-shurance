@@ -452,6 +452,38 @@ mod tests {
     }
 
     #[test]
+    fn split_premium_conserves_stroops_for_many_inputs() {
+        let amounts = [
+            0i128, 1, 2, 3, 7, 9, 10, 99, 100, 101, 999, 1_000, 10_000, 1_000_000,
+            9_999_999_999,
+        ];
+        let bps_values = [0u32, 1, 2, 7, 250, 333, 500, 999, 1_000, 1_337, 2_000, 5_000, 10_000];
+        for &amount in &amounts {
+            for &bps in &bps_values {
+                let (to_treasury, fee) = split_premium(amount, bps).unwrap();
+                assert_eq!(
+                    to_treasury + fee,
+                    amount,
+                    "amount={amount} bps={bps}: treasury={to_treasury} fee={fee}"
+                );
+                assert!(fee >= 0 && to_treasury >= 0);
+                if bps == 0 {
+                    assert_eq!(fee, 0);
+                    assert_eq!(to_treasury, amount);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_premium_floor_example() {
+        // 1000 * 250 / 10_000 = 25 exactly
+        assert_eq!(split_premium(1_000, 250).unwrap(), (975, 25));
+        // 999 * 250 / 10_000 = 24.975 → floor 24
+        assert_eq!(split_premium(999, 250).unwrap(), (975, 24));
+    }
+
+    #[test]
     fn compute_premium_missing_region_errors() {
         // Build a table with only Medium/High region entries (missing Low)
         use soroban_sdk::{Env, Map};
