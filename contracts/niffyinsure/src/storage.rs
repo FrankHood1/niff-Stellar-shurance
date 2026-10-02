@@ -5,6 +5,7 @@ use crate::types::{
     Claim, MultiplierTable, Policy, PolicyLookupKey, PolicyStatus, RollingClaimWindowState,
     VoteDelegation, VoteOption,
 };
+use crate::validate;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
 ///
@@ -831,7 +832,7 @@ pub fn add_voter(env: &Env, holder: &Address) -> Result<(), validate::Error> {
         }
     }
     if !found {
-        if voters.len() >= MAX_ELIGIBLE_VOTERS as usize {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
             return Err(validate::Error::VoterRegistryFull);
         }
         voters.push_back(holder.clone());
@@ -870,7 +871,7 @@ pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), validate:
         }
     }
     if !found {
-        if voters.len() >= MAX_ELIGIBLE_VOTERS as usize {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
             return Err(validate::Error::VoterRegistryFull);
         }
         voters.push_back(holder.clone());
