@@ -5,6 +5,7 @@ use crate::types::{
     Claim, MultiplierTable, Policy, PolicyLookupKey, RollingClaimWindowState,
     VoteDelegation, VoteOption,
 };
+use crate::validate;
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
 ///
@@ -956,11 +957,18 @@ pub fn set_voters(env: &Env, voters: &Vec<Address>) {
 ///
 /// Reverts with [`crate::validate::Error::VoterRegistryFull`] when the registry
 /// is already at [`MAX_ELIGIBLE_VOTERS`].
-pub fn add_voter(env: &Env, holder: &Address) -> Result<(), crate::validate::Error> {
-    migrate_legacy_voters_if_needed(env);
-    if !voter_registry_contains(env, holder) {
-        if voter_registry_len(env) >= MAX_ELIGIBLE_VOTERS {
-            return Err(crate::validate::Error::VoterRegistryFull);
+pub fn add_voter(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+    let mut voters = get_voters(env);
+    let mut found = false;
+    for v in voters.iter() {
+        if v == *holder {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
+            return Err(validate::Error::VoterRegistryFull);
         }
         append_voter_unchecked(env, holder);
     }
@@ -987,11 +995,18 @@ pub fn get_holder_active_policy_count(env: &Env, holder: &Address) -> u32 {
     get_active_policy_count(env, holder)
 }
 
-pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), crate::validate::Error> {
-    migrate_legacy_voters_if_needed(env);
-    if !voter_registry_contains(env, holder) {
-        if voter_registry_len(env) >= MAX_ELIGIBLE_VOTERS {
-            return Err(crate::validate::Error::VoterRegistryFull);
+pub fn voters_ensure_holder(env: &Env, holder: &Address) -> Result<(), validate::Error> {
+    let mut voters = get_voters(env);
+    let mut found = false;
+    for v in voters.iter() {
+        if v == *holder {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        if voters.len() >= MAX_ELIGIBLE_VOTERS {
+            return Err(validate::Error::VoterRegistryFull);
         }
         append_voter_unchecked(env, holder);
     }
