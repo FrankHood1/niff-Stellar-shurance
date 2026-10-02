@@ -284,6 +284,9 @@ pub enum DataKey {
     // ── Issue #782: Token decimal normalization ───────────────────────────────
     /// Stored decimals for an allowlisted asset (queried at bind time).
     AssetDecimals(Address),
+    // ── Issue #1426: Per-asset internal ledger accounting ─────────────────────
+    /// Internal liability counters for an asset (treasury, reserved, premiums, paid).
+    AssetLedger(Address),
 }
 
 pub fn has_open_claim(env: &Env, holder: &Address, policy_id: u32) -> bool {
@@ -2922,4 +2925,18 @@ pub fn get_asset_decimals(env: &Env, asset: &Address) -> Option<u32> {
     env.storage()
         .instance()
         .get(&DataKey::AssetDecimals(asset.clone()))
+}
+
+// ── Issue #1426: Per-asset internal ledger accounting ─────────────────────────
+
+pub fn set_asset_ledger(env: &Env, asset: &Address, ledger: &crate::ledger::AssetLedger) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetLedger(asset.clone()), ledger);
+}
+
+pub fn get_asset_ledger(env: &Env, asset: &Address) -> Option<crate::ledger::AssetLedger> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetLedger(asset.clone()))
 }

@@ -276,9 +276,14 @@ fn terminate_inner(
 
     // Transfer refund from treasury to holder (only for holder-initiated termination).
     // Admin terminations do not trigger automatic refunds.
+    // Release reserved coverage regardless of refund path (issue #1426).
+    let _ = crate::ledger::release_coverage(env, &policy.asset, policy.coverage);
     if !by_admin && refund_amount > 0 {
         let treasury = storage::get_treasury(env);
-        token::transfer(env, &policy.asset, &treasury, holder, refund_amount);
+        // CEI: debit internal treasury before host transfer.
+        let _ = crate::ledger::record_payout_out(env, &policy.asset, refund_amount, 0);
+        // Grandfathered bound asset (may be delisted — issue #1425).
+        token::transfer_bound_asset(env, &policy.asset, &treasury, holder, refund_amount);
     }
 
     emit_policy_terminated(

@@ -1,3 +1,17 @@
+//! Pure premium calculation functions — no `Env` dependency.
+//!
+//! # Sharing with `niffyinsure` (issue #1428)
+//!
+//! The authoritative staged formula and golden vectors live in
+//! `contracts/niffyinsure/src/premium_pure.rs` and
+//! `contracts/niffyinsure/testdata/golden-vectors.json`.
+//!
+//! **Choice:** do not duplicate that module here. This calculator contract keeps
+//! a thin on-chain `compute` entrypoint for cross-contract quotes; numerical
+//! parity with niffyinsure is enforced by the golden-vector suite. A shared
+//! crate was considered but deferred because error enums differ and both crates
+//! already ship independently deployable WASMs. Prefer `#[path]` / workspace
+//! extraction if a third consumer appears.
 #![no_std]
 
 mod errors;
