@@ -84,12 +84,12 @@ pub const QUORUM_BPS_MAX: u32 = 10_000;
 /// One full turn-out / 100% weight in bps (used in the quorum formula below).
 pub const QUORUM_BPS_DENOMINATOR: u32 = 10_000;
 
-/// Absolute maximum protocol fee in basis points.
-pub const PROTOCOL_FEE_BPS_MAX: u32 = 1_000;
+/// Absolute maximum protocol fee in basis points (20%).
+pub const PROTOCOL_FEE_BPS_MAX: u32 = 2_000;
 
-/// Solvency threshold bounds in basis points. `100_000` = 1,000%.
+/// Solvency threshold bounds in basis points. `10_000` = 100%.
 pub const MIN_SOLVENCY_RATIO_BPS_MIN: u32 = 0;
-pub const MIN_SOLVENCY_RATIO_BPS_MAX: u32 = 100_000;
+pub const MIN_SOLVENCY_RATIO_BPS_MAX: u32 = 10_000;
 
 /// Hard cap on `page_size` for `get_inactive_policies`.
 pub const INACTIVE_POLICIES_PAGE_SIZE_MAX: u32 = 20;
@@ -405,6 +405,17 @@ pub struct PolicyLookupKey {
     pub policy_id: u32,
 }
 
+/// Ledger boundaries for a single claim's commit-reveal cycle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitRevealPhases {
+    /// Last ledger (inclusive) during which commitments are accepted.
+    pub commit_phase_end_ledger: u32,
+    /// Last ledger (inclusive) during which reveals are accepted.
+    /// Must be strictly greater than `commit_phase_end_ledger`.
+    pub reveal_phase_end_ledger: u32,
+}
+
 /// Lightweight policy summary returned by `list_policies`.
 ///
 /// Omits large or rarely-needed fields (`details`, `evidence`, etc.) to keep
@@ -612,10 +623,34 @@ pub enum MultiplierKey {
     SafetyDiscount,
 }
 
-#[contractevent(topics = ["niffyinsure", "premium_table_updated"])]
+/// Emitted when the global multiplier table is replaced (`update_multiplier_table`).
+/// Carries the new table version counter so indexers can track pricing config.
+#[contractevent(topics = ["niffyinsure", "multiplier_table_updated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PremiumTableUpdated {
+pub struct MultiplierTableUpdated {
     pub version: u32,
+}
+
+/// Backward-compatible alias for [`MultiplierTableUpdated`].
+pub type PremiumTableUpdated = MultiplierTableUpdated;
+
+/// Which engine produced a quote.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CalcSource {
+    Local,
+    External,
+}
+
+/// Read-only quote result returned by `generate_premium` / `generate_premium_for_asset`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteResult {
+    pub premium: i128,
+    pub coverage: i128,
+    pub asset: Option<Address>,
+    pub table_version: u32,
+    pub calc_source: CalcSource,
 }
 
 /// Emitted by `admin_set_premium_multiplier` for each granular update.
@@ -820,8 +855,8 @@ pub struct PremiumQuote {
 
 /// Human-readable identity information returned by `get_contract_metadata`.
 ///
-/// All fields are compile-time constants; no storage reads occur on the call path.
-/// Safe to call via simulation without authentication.
+/// After `initialize`, includes the live admin, treasury token, and init ledger.
+/// Safe to call via simulation without authentication once initialized.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractMetadata {
@@ -829,6 +864,9 @@ pub struct ContractMetadata {
     pub version: String,
     /// Short hint identifying the target Stellar network (non-binding, for tooling convenience).
     pub network_passphrase_hint: String,
+    pub admin: Address,
+    pub token: Address,
+    pub init_ledger: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
